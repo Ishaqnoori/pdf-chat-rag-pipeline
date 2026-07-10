@@ -1,0 +1,8 @@
+venv/
+__pycache__/
+.env
+faiss_index/
+.streamlit/secrets.toml
+*.pdf
+!data/sample.pdf
+.DS_Store
