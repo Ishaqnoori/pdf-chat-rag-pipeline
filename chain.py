@@ -1,21 +1,23 @@
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.runnables import RunnablePassthrough
-from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.output_parsers import StrOutputParser
 from utils.citations import format_docs_with_citations
+from utils.llm import get_llm
+from langchain_core.runnables.history import RunnableWithMessageHistory
 
-def get_conversational_chain(retriever):
+def get_conversational_chain(retriever, get_session_history):
     """
-    Builds an LCEL chain for conversational retrieval.
+    Builds an LCEL chain for conversational retrieval using Groq.
     
     Args:
         retriever: The LangChain retriever object.
+        get_session_history: Callable that returns a BaseChatMessageHistory.
         
     Returns:
-        Runnable: The LCEL chain ready to be invoked.
+        Runnable: The LCEL chain wrapped with history.
     """
-    # Use Gemini 1.5 Pro for chat generation
-    llm = ChatGoogleGenerativeAI(model="gemini-1.5-pro", temperature=0.3)
+    # Use Groq Llama 3.3 for chat generation
+    llm = get_llm()
     
     # 1. Prompt to contextualize the user's question based on history
     contextualize_q_system_prompt = (
@@ -78,4 +80,14 @@ def get_conversational_chain(retriever):
     # Final chain returns a dict with 'docs' and 'answer'
     conversational_rag_chain = retrieval | format_docs | RunnablePassthrough.assign(answer=answer_chain)
     
-    return conversational_rag_chain
+    # Wrap with history
+    chain_with_history = RunnableWithMessageHistory(
+        conversational_rag_chain,
+        get_session_history,
+        input_messages_key="question",
+        history_messages_key="chat_history",
+        output_messages_key="answer"
+    )
+    
+    return chain_with_history
+

@@ -2,6 +2,7 @@ import streamlit as st
 import os
 import tempfile
 from langchain_core.messages import HumanMessage, AIMessage
+from langchain_core.chat_history import InMemoryChatMessageHistory
 
 from rag_pipeline import build_vector_store, get_retriever
 from chain import get_conversational_chain
@@ -9,20 +10,28 @@ from chain import get_conversational_chain
 st.set_page_config(page_title="PDF Chat RAG", page_icon="📄")
 
 # --- Security and Config: Fallback to st.secrets ---
-if not os.getenv("GOOGLE_API_KEY"):
-    try:
-        os.environ["GOOGLE_API_KEY"] = st.secrets["GOOGLE_API_KEY"]
-    except Exception:
-        pass # Will likely fail downstream if no key is provided
+for key in ["GOOGLE_API_KEY", "GROQ_API_KEY"]:
+    if not os.getenv(key):
+        try:
+            os.environ[key] = st.secrets[key]
+        except Exception:
+            pass # Will likely fail downstream if no key is provided
 
 st.title("📄 Chat with your PDF")
-st.markdown("Powered by Google Gemini 1.5 Pro and LangChain")
+st.markdown("Powered by Groq (Llama 3.3), Gemini (Embeddings), and LangChain")
 
 # --- Session State Initialization ---
 if "messages" not in st.session_state:
     st.session_state["messages"] = []
 if "retriever_initialized" not in st.session_state:
     st.session_state.retriever_initialized = False
+    
+# Store for RunnableWithMessageHistory
+if "chat_history_store" not in st.session_state:
+    st.session_state.chat_history_store = InMemoryChatMessageHistory()
+
+def get_session_history(session_id: str):
+    return st.session_state.chat_history_store
 
 # --- Caching the Vector Index Build ---
 @st.cache_resource
@@ -50,7 +59,7 @@ with st.sidebar:
                     st.session_state.retriever_initialized = True
                     st.success("PDF processed successfully! You can now start chatting.")
                 except Exception as e:
-                    st.error(f"Error processing PDF: {str(e)}. Please check your API key.")
+                    st.error(f"Error processing PDF: {str(e)}. Please check your API keys.")
                 finally:
                     if os.path.exists(tmp_pdf_path):
                         os.remove(tmp_pdf_path)
@@ -61,6 +70,7 @@ with st.sidebar:
     st.divider()
     if st.button("Clear chat"):
         st.session_state["messages"] = []
+        st.session_state.chat_history_store.clear()
         st.rerun()
 
 # --- Main Chat Area ---
@@ -85,23 +95,16 @@ if st.session_state.retriever_initialized:
         
         # Build the chain
         retriever = get_retriever()
-        chain = get_conversational_chain(retriever)
+        chain = get_conversational_chain(retriever, get_session_history)
         
         with st.chat_message("assistant"):
             with st.spinner("Thinking..."):
                 try:
-                    # Transform messages into Langchain format for the chain
-                    chat_history = []
-                    for m in st.session_state["messages"][:-1]: # exclude the latest
-                        if m["role"] == "user":
-                            chat_history.append(HumanMessage(content=m["content"]))
-                        else:
-                            chat_history.append(AIMessage(content=m["content"]))
-
-                    response = chain.invoke({
-                        "question": user_query,
-                        "chat_history": chat_history
-                    })
+                    # RunnableWithMessageHistory handles injecting and updating history natively
+                    response = chain.invoke(
+                        {"question": user_query},
+                        config={"configurable": {"session_id": "default"}}
+                    )
                     
                     answer = response["answer"]
                     docs = response["docs"]
@@ -113,7 +116,7 @@ if st.session_state.retriever_initialized:
                     if sources:
                         st.caption(f"Sources: Page {', '.join(map(str, sources))}")
                     
-                    # Update history
+                    # Update UI history
                     st.session_state["messages"].append({
                         "role": "assistant", 
                         "content": answer,
