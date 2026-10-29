@@ -1,130 +1,134 @@
-import streamlit as st
+import hashlib
 import os
 import tempfile
-from langchain_core.messages import HumanMessage, AIMessage
-from langchain_core.chat_history import InMemoryChatMessageHistory
 
-from rag_pipeline import build_vector_store, get_retriever
-from chain import get_conversational_chain
+import streamlit as st
+from langchain_core.chat_history import InMemoryChatMessageHistory
 
 st.set_page_config(page_title="PDF Chat RAG", page_icon="📄")
 
-# --- Security and Config: Fallback to st.secrets ---
-for key in ["GOOGLE_API_KEY", "GROQ_API_KEY"]:
+# --- Config: fall back to st.secrets if keys aren't in the environment ---
+# Must run before the model helpers are first called.
+for key in ["GOOGLE_API_KEY", "GROQ_API_KEY", "GROQ_MODEL", "GEMINI_EMBEDDING_MODEL"]:
     if not os.getenv(key):
         try:
             os.environ[key] = st.secrets[key]
         except Exception:
-            pass # Will likely fail downstream if no key is provided
+            pass
+
+from chain import get_conversational_chain  # noqa: E402
+from rag_pipeline import build_vector_store, get_retriever  # noqa: E402
+from utils.citations import extract_citations  # noqa: E402
 
 st.title("📄 Chat with your PDF")
-st.markdown("Powered by Groq (Llama 3.3), Gemini (Embeddings), and LangChain")
+st.markdown("Powered by Groq, Gemini embeddings, and LangChain")
 
-# --- Session State Initialization ---
-if "messages" not in st.session_state:
-    st.session_state["messages"] = []
-if "retriever_initialized" not in st.session_state:
-    st.session_state.retriever_initialized = False
-    
-# Store for RunnableWithMessageHistory
-if "chat_history_store" not in st.session_state:
-    st.session_state.chat_history_store = InMemoryChatMessageHistory()
+missing = [k for k in ["GOOGLE_API_KEY", "GROQ_API_KEY"] if not os.getenv(k)]
+if missing:
+    st.error(f"Missing API key(s): {', '.join(missing)}. Add them to `.env` or `.streamlit/secrets.toml`.")
+    st.stop()
+
+# --- Session state ---
+st.session_state.setdefault("messages", [])
+st.session_state.setdefault("chain", None)
+st.session_state.setdefault("doc_hash", None)
+st.session_state.setdefault("chat_history_store", InMemoryChatMessageHistory())
+
 
 def get_session_history(session_id: str):
     return st.session_state.chat_history_store
 
-# --- Caching the Vector Index Build ---
-@st.cache_resource
-def process_pdf(file_path):
-    """
-    Builds the vector store. Uses Streamlit's cache_resource to prevent 
-    rebuilding the index on every UI interaction.
-    """
-    return build_vector_store(file_path)
 
-# --- Sidebar: File Upload & Controls ---
+def reset_chat():
+    st.session_state["messages"] = []
+    st.session_state.chat_history_store.clear()
+
+
+@st.cache_resource(show_spinner=False)
+def process_pdf(_file_bytes: bytes, filename: str, file_hash: str):
+    """
+    Builds the vector store once per unique file. Cached on the file's SHA-256
+    (the leading underscore tells Streamlit not to hash the raw bytes). The old
+    version cached on a random temp path, so the cache never hit.
+    """
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+        tmp.write(_file_bytes)
+        tmp_path = tmp.name
+    try:
+        return build_vector_store(tmp_path, source_name=filename)
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+
+# --- Sidebar ---
 with st.sidebar:
     st.header("Document & Settings")
     uploaded_file = st.file_uploader("Choose a PDF file", type="pdf")
-    
+
     if uploaded_file is not None:
         if st.button("Process PDF"):
+            file_bytes = uploaded_file.getvalue()
+            file_hash = hashlib.sha256(file_bytes).hexdigest()
             with st.spinner("Processing document (chunking & embedding)..."):
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
-                    tmp_file.write(uploaded_file.getvalue())
-                    tmp_pdf_path = tmp_file.name
-                
                 try:
-                    process_pdf(tmp_pdf_path)
-                    st.session_state.retriever_initialized = True
-                    st.success("PDF processed successfully! You can now start chatting.")
+                    vector_store = process_pdf(file_bytes, uploaded_file.name, file_hash)
+                    st.session_state.chain = get_conversational_chain(
+                        get_retriever(vector_store), get_session_history
+                    )
+                    if st.session_state.doc_hash != file_hash:
+                        reset_chat()  # history from a different PDF would confuse the model
+                    st.session_state.doc_hash = file_hash
+                    st.success("PDF processed! You can start chatting.")
+                except ValueError as e:
+                    st.error(str(e))
                 except Exception as e:
-                    st.error(f"Error processing PDF: {str(e)}. Please check your API keys.")
-                finally:
-                    if os.path.exists(tmp_pdf_path):
-                        os.remove(tmp_pdf_path)
+                    st.error(f"Error processing PDF: {e}")
     else:
         st.info("Please upload a PDF to begin.")
-        st.session_state.retriever_initialized = False
-        
+        st.session_state.chain = None
+        st.session_state.doc_hash = None
+
     st.divider()
     if st.button("Clear chat"):
-        st.session_state["messages"] = []
-        st.session_state.chat_history_store.clear()
+        reset_chat()
         st.rerun()
 
-# --- Main Chat Area ---
-if st.session_state.retriever_initialized:
-    # Display chat history
+# --- Main chat area ---
+if st.session_state.chain is not None:
     for msg in st.session_state["messages"]:
         with st.chat_message(msg["role"]):
             st.write(msg["content"])
             if msg.get("sources"):
-                st.caption(f"Sources: Page {', '.join(map(str, msg['sources']))}")
+                st.caption(f"Sources: Page {', '.join(msg['sources'])}")
 
-    # Chat Input
     user_query = st.chat_input("Ask a question about your document...")
-    
-    # Guard against empty or whitespace-only chat input
+
     if user_query and user_query.strip():
-        # Display user question
         with st.chat_message("user"):
             st.write(user_query)
-        
         st.session_state["messages"].append({"role": "user", "content": user_query})
-        
-        # Build the chain
-        retriever = get_retriever()
-        chain = get_conversational_chain(retriever, get_session_history)
-        
+
         with st.chat_message("assistant"):
             with st.spinner("Thinking..."):
                 try:
-                    # RunnableWithMessageHistory handles injecting and updating history natively
-                    response = chain.invoke(
+                    response = st.session_state.chain.invoke(
                         {"question": user_query},
-                        config={"configurable": {"session_id": "default"}}
+                        config={"configurable": {"session_id": "default"}},
                     )
-                    
                     answer = response["answer"]
-                    docs = response["docs"]
-                    
-                    # Extract unique pages for citations
-                    sources = list(set([doc.metadata.get("page", "Unknown") for doc in docs if doc.metadata.get("page") is not None]))
-                    
+                    sources = extract_citations(response["docs"])
+
                     st.write(answer)
                     if sources:
-                        st.caption(f"Sources: Page {', '.join(map(str, sources))}")
-                    
-                    # Update UI history
-                    st.session_state["messages"].append({
-                        "role": "assistant", 
-                        "content": answer,
-                        "sources": sources
-                    })
-                    
+                        st.caption(f"Sources: Page {', '.join(sources)}")
+
+                    st.session_state["messages"].append(
+                        {"role": "assistant", "content": answer, "sources": sources}
+                    )
                 except Exception as e:
-                    st.error(f"An error occurred during generation: {str(e)}")
+                    st.error(f"An error occurred during generation: {e}")
+elif uploaded_file is None:
+    st.warning("Upload a document from the sidebar to chat with it.")
 else:
-    if not uploaded_file:
-        st.warning("Upload a document from the sidebar to chat with it.")
+    st.info("Click **Process PDF** in the sidebar.")

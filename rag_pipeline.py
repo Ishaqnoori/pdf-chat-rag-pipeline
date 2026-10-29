@@ -1,58 +1,44 @@
 import os
 import shutil
+
 from langchain_community.vectorstores import FAISS
-from utils.loaders import load_and_split_pdf
+
 from utils.embeddings import get_embeddings_model
+from utils.loaders import load_and_split_pdf
 
 INDEX_DIR = "faiss_index"
 
-def build_vector_store(pdf_path: str):
+
+def build_vector_store(pdf_path: str, source_name: str | None = None):
     """
-    Builds a FAISS vector store from a PDF file and saves it to disk.
-    
-    Args:
-        pdf_path (str): The path to the uploaded PDF file.
-        
-    Returns:
-        FAISS: The initialized vector store.
+    Builds a FAISS vector store from a PDF and saves it to disk.
     """
-    # 1. Load and split the PDF
-    chunks = load_and_split_pdf(pdf_path)
-    
-    # 2. Get the embeddings model
-    embeddings = get_embeddings_model()
-    
-    # 3. Build the FAISS index
-    vector_store = FAISS.from_documents(chunks, embeddings)
-    
-    # 4. Save to disk (clear old index if exists)
+    chunks = load_and_split_pdf(pdf_path, source_name=source_name)
+    vector_store = FAISS.from_documents(chunks, get_embeddings_model())
+
     if os.path.exists(INDEX_DIR):
         shutil.rmtree(INDEX_DIR)
-    
     vector_store.save_local(INDEX_DIR)
-    
+
     return vector_store
+
 
 def load_vector_store():
     """
-    Loads an existing FAISS vector store from disk.
-    
-    Returns:
-        FAISS: The loaded vector store, or None if it doesn't exist.
+    Loads the FAISS store from disk, or returns None if there isn't one.
     """
     if not os.path.exists(INDEX_DIR):
         return None
-        
-    embeddings = get_embeddings_model()
-    # Allow dangerous deserialization because we created the index locally
-    vector_store = FAISS.load_local(INDEX_DIR, embeddings, allow_dangerous_deserialization=True)
-    return vector_store
+    # Safe here only because we create the index ourselves — never load an index from an untrusted source.
+    return FAISS.load_local(INDEX_DIR, get_embeddings_model(), allow_dangerous_deserialization=True)
 
-def get_retriever(k=4):
+
+def get_retriever(vector_store=None, k: int = 4):
     """
-    Gets the retriever interface from the loaded vector store.
+    Returns an MMR retriever. Pass an in-memory vector_store to skip reloading from disk.
     """
-    vector_store = load_vector_store()
-    if not vector_store:
+    if vector_store is None:
+        vector_store = load_vector_store()
+    if vector_store is None:
         return None
-    return vector_store.as_retriever(search_type="mmr", search_kwargs={"k": k})
+    return vector_store.as_retriever(search_type="mmr", search_kwargs={"k": k, "fetch_k": 20})

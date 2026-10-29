@@ -1,32 +1,36 @@
+def _display_page(doc):
+    """
+    PyPDFLoader stores 'page' as 0-indexed, so page 1 shows up as 0.
+    Prefer 'page_label' (the printed page number) when available, else page + 1.
+    """
+    label = doc.metadata.get("page_label")
+    if label not in (None, ""):
+        return str(label)
+    page = doc.metadata.get("page")
+    if isinstance(page, int):
+        return str(page + 1)
+    return None
+
+
 def format_docs_with_citations(docs):
     """
-    Formats a list of retrieved documents into a single string with citations.
-    
-    Args:
-        docs (list): A list of LangChain Document objects.
-        
-    Returns:
-        str: Formatted string containing the document content and source pages.
+    Formats retrieved documents into one context string with source/page tags.
     """
-    formatted_texts = []
+    formatted = []
     for i, doc in enumerate(docs):
-        # Extract metadata (e.g., page number)
         source = doc.metadata.get("source", "Unknown")
-        page = doc.metadata.get("page", "Unknown")
-        
-        # Format the text with a citation
-        text = f"--- Document {i+1} (Source: {source}, Page: {page}) ---\n{doc.page_content}"
-        formatted_texts.append(text)
-        
-    return "\n\n".join(formatted_texts)
+        page = _display_page(doc) or "Unknown"
+        formatted.append(f"--- Document {i + 1} (Source: {source}, Page: {page}) ---\n{doc.page_content}")
+    return "\n\n".join(formatted)
+
 
 def extract_citations(docs):
     """
-    Extracts citation metadata to be displayed in the UI.
+    Returns unique, human-readable page numbers in ascending order.
     """
-    citations = []
-    for doc in docs:
-        page = doc.metadata.get("page", "Unknown")
-        if page not in citations:
-            citations.append(page)
-    return citations
+    pages = {p for p in (_display_page(d) for d in docs) if p is not None}
+
+    def sort_key(p):
+        return (0, int(p), "") if p.isdigit() else (1, 0, p)
+
+    return sorted(pages, key=sort_key)

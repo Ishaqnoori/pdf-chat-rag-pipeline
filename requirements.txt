@@ -1,8 +1,18 @@
-streamlit>=1.31.0
-langchain>=0.1.0
-langchain-community>=0.0.10
-langchain-google-genai>=0.0.9
-langchain-groq>=0.1.0
-faiss-cpu>=1.7.4
-pypdf>=4.0.0
+# Core RAG
+langchain>=1.0.0
+langchain-core>=1.0.0
+langchain-community>=0.4.0
+langchain-text-splitters>=1.0.0
+langchain-google-genai>=4.0.0
+langchain-groq>=1.0.0
+faiss-cpu>=1.8.0
+pypdf>=5.0.0
 python-dotenv>=1.0.0
+
+# Streamlit UI (app.py)
+streamlit>=1.31.0
+
+# FastAPI backend (main.py)
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+python-multipart>=0.0.9

@@ -1,36 +1,49 @@
 # PDF Chat RAG Pipeline
 
-A Streamlit application that allows you to chat with a PDF document using Google's Gemini models, LangChain, and FAISS.
+Chat with a PDF using LangChain, FAISS, Gemini embeddings, and Groq for generation.
+Two ways to run it: a **Streamlit app** (`app.py`) or a **FastAPI backend** (`main.py`) for a separate frontend.
 
 ## Features
-- Upload PDF documents
-- Automatic chunking and indexing using FAISS
-- Conversational interface to ask questions about the document
-- Generation powered by **Groq (Llama 3.3)** for extreme speed (`llama-3.3-70b-versatile`)
-- Embeddings powered by Google Gemini (`models/embedding-001`)
+- Upload a PDF → chunk → embed → FAISS index
+- Conversational follow-ups (questions are rewritten using chat history)
+- Page-number citations for every answer
+- Generation: Groq `openai/gpt-oss-120b` (configurable via `GROQ_MODEL`)
+- Embeddings: Gemini `models/gemini-embedding-001` (configurable via `GEMINI_EMBEDDING_MODEL`)
 
 ## Setup
 
-1. Create a virtual environment:
-   ```bash
-   python -m venv venv
-   source venv/bin/activate  # On Windows: venv\Scripts\activate
-   ```
+```bash
+python -m venv venv
+venv\Scripts\activate            # macOS/Linux: source venv/bin/activate
+pip install -r requirements.txt
+```
 
-2. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
+Copy `.env.example` to `.env` and fill in `GOOGLE_API_KEY` and `GROQ_API_KEY`
+(or put them in `.streamlit/secrets.toml` for the Streamlit app).
 
-3. Configure your API keys:
-   - Create a `.env` file in the root directory and add:
-     ```
-     GOOGLE_API_KEY=your_google_api_key_here
-     GROQ_API_KEY=your_groq_api_key_here
-     ```
-   - Alternatively, for Streamlit secrets, copy `.streamlit/secrets.toml` and update the keys.
+## Run
 
-4. Run the app:
-   ```bash
-   streamlit run app.py
-   ```
+**Streamlit UI**
+```bash
+streamlit run app.py
+```
+
+**FastAPI backend**
+```bash
+uvicorn main:app --reload --port 8000
+```
+Docs at http://localhost:8000/docs. Endpoints:
+
+| Method | Path | Body / Params | Returns |
+|---|---|---|---|
+| GET | `/health` | – | status + current document |
+| POST | `/upload` | multipart `file` (PDF) | success message |
+| POST | `/chat` | `{"session_id": "...", "message": "..."}` | `{"answer": "...", "sources": ["1","3"]}` |
+| DELETE | `/clear?session_id=...` | – | status |
+
+Set `ALLOWED_ORIGINS` in `.env` if your frontend isn't on `http://localhost:5173`.
+
+## Notes
+- If you change the embedding model, delete `faiss_index/` and re-upload — old vectors won't match.
+- Scanned/image-only PDFs have no text layer; run OCR first.
+- The backend keeps one document and chat history in memory — fine for a demo, not for multi-user production.

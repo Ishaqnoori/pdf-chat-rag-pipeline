@@ -7,7 +7,7 @@ from langchain_core.runnables.history import RunnableWithMessageHistory
 
 def get_conversational_chain(retriever, get_session_history):
     """
-    Builds an LCEL chain for conversational retrieval using Groq.
+    Builds an LCEL conversational retrieval chain (Groq for generation).
     
     Args:
         retriever: The LangChain retriever object.
@@ -16,7 +16,9 @@ def get_conversational_chain(retriever, get_session_history):
     Returns:
         Runnable: The LCEL chain wrapped with history.
     """
-    # Use Groq Llama 3.3 for chat generation
+    if retriever is None:
+        raise ValueError("Retriever is None — process a PDF before building the chain.")
+
     llm = get_llm()
     
     # 1. Prompt to contextualize the user's question based on history
@@ -90,4 +92,3 @@ def get_conversational_chain(retriever, get_session_history):
     )
     
     return chain_with_history
-
