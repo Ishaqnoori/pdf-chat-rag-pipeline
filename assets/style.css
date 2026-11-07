@@ -341,7 +341,6 @@ body:has([data-testid="stSidebarCollapsedControl"]) .st-key-model_top { left: 3.
 .set-bar i { display: block; height: 100%; border-radius: 6px; background: var(--text); }
 .set-bar.low i { background: #D9A400; }
 .set-bar.full i { background: #E5484D; }
-.set-sub { color: var(--faint); font-size: 0.76rem; }
 .set-kv { display: flex; justify-content: space-between; gap: 1rem; padding: 0.55rem 0; border-bottom: 1px solid var(--line); font-size: 0.92rem; }
 .set-kv:last-child { border-bottom: none; }
 .set-kv span:first-child { color: var(--muted); }
@@ -404,3 +403,31 @@ body:has([data-testid="stSidebarCollapsedControl"]) .st-key-model_top { left: 3.
 .set-fb { display: flex; gap: 0.7rem; padding: 0.55rem 0; border-bottom: 1px solid var(--line); }
 .set-fb b { display: block; color: var(--text); font-weight: 500; font-size: 0.9rem; }
 .set-fb small { color: var(--faint); font-size: 0.76rem; }
+.reattach { border: 1px dashed var(--strong-line); border-radius: 12px; padding: 0.6rem 0.9rem; margin: 0 0 1rem;
+            color: var(--muted); font-size: 0.88rem; text-align: center; }
+.reattach b { color: var(--text); }
+
+/* Legal pages and links */
+.st-key-legal_page { max-width: 46rem; margin: 2rem auto 0; }
+.st-key-legal_page h3 { font-size: 1.4rem; margin-bottom: 0.2rem; }
+.st-key-legal_page p, .st-key-legal_page li { color: var(--muted); font-size: 0.93rem; line-height: 1.6; }
+.st-key-legal_page strong { color: var(--text); }
+.st-key-legal_links { justify-content: center; gap: 0.5rem; max-width: 22rem; margin: 0.4rem auto 0; }
+.st-key-legal_links button { background: transparent !important; border: none !important; box-shadow: none !important;
+  color: var(--faint) !important; padding: 0 0.3rem !important; min-height: 0 !important; }
+.st-key-legal_links button:hover { color: var(--text) !important; text-decoration: underline; }
+.st-key-legal_links button p { font-size: 0.8rem !important; }
+.st-key-legal_links [data-testid="stElementContainer"] { width: auto !important; }
+.st-key-account_data { max-width: 46rem; margin: 0 auto; }
+.st-key-account_data [data-testid="stExpander"] details { border-color: #E5484D55; border-radius: 12px; }
+.st-key-delete_account_btn button { background: #E5484D !important; border: none !important; color: #fff !important; }
+
+
+/* Sign-up honeypot: invisible and unreachable for people (not display:none, which some bots skip) */
+.st-key-hp { position: absolute !important; left: -10000px !important; width: 1px; height: 1px; overflow: hidden; }
+
+/* Logo next to the app name */
+.brand { display: flex; align-items: center; gap: 0.55rem; }
+.brand svg { flex: none; border-radius: 6px; }
+.login .brand-lg { display: flex; flex-direction: column; align-items: center; gap: 0.7rem; }
+.login .brand-lg svg { border-radius: 12px; box-shadow: 0 6px 20px rgba(47, 124, 246, 0.25); }

@@ -1,20 +1,20 @@
 import hashlib
-import json
 import html
 import os
+import re
 import tempfile
 import time
 import uuid
-from datetime import datetime, timezone
-from zoneinfo import ZoneInfo
 
-import altair as alt
-import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
 from langchain_core.chat_history import InMemoryChatMessageHistory
 
-st.set_page_config(page_title="Ask your PDF", page_icon="📄", layout="wide")
+st.set_page_config(
+    page_title="Ask your PDF",
+    page_icon=os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "favicon.png"),
+    layout="wide",
+)
 
 # ---------------------------------------------------------------- config (item 1)
 # Keys come from .env locally or the host's Secrets when deployed; never from code.
@@ -22,7 +22,7 @@ st.set_page_config(page_title="Ask your PDF", page_icon="📄", layout="wide")
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(APP_DIR, ".env"))  # always the .env next to app.py
 CONFIG_KEYS = ["GOOGLE_API_KEY", "GROQ_API_KEY", "FIREBASE_API_KEY", "GROQ_MODEL", "GEMINI_EMBEDDING_MODEL",
-               "ADMIN_EMAILS"]
+               "ADMIN_EMAILS", "CONTACT_EMAIL", "SENTRY_DSN", "SESSION_SECRET"]
 
 
 def _is_placeholder(value) -> bool:
@@ -39,18 +39,32 @@ for key in CONFIG_KEYS:
         except Exception:
             pass
 
+# Imported after the config loop above, because these modules read the keys at import time
 from chain import get_conversational_chain  # noqa: E402
 from rag_pipeline import build_index, get_retriever, merge_indexes  # noqa: E402
-from utils import auth  # noqa: E402
+from utils import auth, legal, monitoring, quota, session, store  # noqa: E402
+from utils.brand import logo_svg  # noqa: E402
 from utils.citations import sources_label  # noqa: E402
-from utils.llm import AVAILABLE_MODELS, MODEL_DAILY_LIMITS, default_model, is_rate_limit, retry_after_seconds  # noqa: E402
+from utils.llm import AVAILABLE_MODELS, MODEL_IDS, is_rate_limit, retry_after_seconds  # noqa: E402
 from utils.loaders import validate_pdf  # noqa: E402
 from utils.render import render_answer, split_followups, stream_preview  # noqa: E402
-from utils.stats import is_admin, stats  # noqa: E402
-from utils.security import MAX_QUESTION, clean_text, limiter, log, register_model_limits, wait_text  # noqa: E402
+from utils.security import MAX_QUESTION, clean_text, limiter, log, wait_text  # noqa: E402
+from utils.stats import stats  # noqa: E402
+from views import login as login_view  # noqa: E402
+from views import settings as settings_view  # noqa: E402
 
-with open(os.path.join(APP_DIR, "assets", "style.css"), encoding="utf-8") as f:
-    st.markdown(f"<style>{f.read()}</style>", unsafe_allow_html=True)
+monitoring.init()  # error alerts by email (Sentry), only if SENTRY_DSN is set
+
+
+@st.cache_resource(show_spinner=False)
+def stylesheet() -> str:
+    """assets/style.css, minified once per process (it's re-sent to the browser on every click)."""
+    with open(os.path.join(APP_DIR, "assets", "style.css"), encoding="utf-8") as f:
+        css = re.sub(r"/\*.*?\*/", "", f.read(), flags=re.S)  # comments
+    css = re.sub(r"\s+", " ", css)
+    return re.sub(r"\s*([{};:,>])\s*", r"\1", css).strip()
+
+st.markdown(f"<style>{stylesheet()}</style>", unsafe_allow_html=True)
 
 missing = [k for k in CONFIG_KEYS[:3] if not os.getenv(k)]
 if missing:
@@ -63,91 +77,16 @@ if missing:
 
 
 # ---------------------------------------------------------------- login gate (item 6)
-def render_login():
-    st.markdown(
-        "<style>[data-testid='stSidebar'], [data-testid='stSidebarCollapsedControl'],"
-        "[data-testid='stExpandSidebarButton'] { display: none !important; }</style>",
-        unsafe_allow_html=True,
-    )
-    view = st.session_state.get("auth_view", "login")
-    title, sub = {
-        "signup": ("Create your account", "Sign up to start chatting with your documents."),
-        "reset": ("Reset your password", "We'll email you a link to choose a new one."),
-    }.get(view, ("Welcome back", "Log in to chat with your documents."))
-    st.markdown(
-        f'<div class="login"><div class="brand-lg">Ask your PDF</div><h1>{title}</h1><p>{sub}</p></div>',
-        unsafe_allow_html=True,
-    )
-
-    def switch(label, to, key):
-        with st.container(key=key):
-            if st.button(label, use_container_width=True):
-                st.session_state.auth_view = to
-                st.rerun()
-
-    with st.container(key="login_box"):
-        notice = st.session_state.pop("auth_notice", None)
-        if notice:
-            st.info(notice)
-
-        if view != "reset" and auth.google_configured():
-            with st.container(key="google_login"):
-                if st.button("Continue with Google", use_container_width=True):
-                    st.login("google")
-            st.markdown('<div class="or">or</div>', unsafe_allow_html=True)
-
-        if view == "signup":
-            with st.form("signup_form", border=False):
-                name = st.text_input("Name", placeholder="Full name", max_chars=80, label_visibility="collapsed")
-                email = st.text_input("Email", placeholder="Email address", max_chars=254, label_visibility="collapsed")
-                password = st.text_input("Password", type="password", placeholder="Password (8+ characters)",
-                                         max_chars=128, label_visibility="collapsed")
-                confirm = st.text_input("Confirm", type="password", placeholder="Confirm password",
-                                        max_chars=128, label_visibility="collapsed")
-                submitted = st.form_submit_button("Create account", use_container_width=True)
-            if submitted:
-                with st.spinner("Creating your account…"):
-                    ok, msg = auth.sign_up(name, email, password, confirm)
-                if ok:
-                    st.session_state.auth_view = "login"
-                    st.session_state.auth_notice = msg
-                    st.rerun()
-                st.error(msg)
-            switch("Already have an account? Log in", "login", "auth_switch")
-
-        elif view == "reset":
-            with st.form("reset_form", border=False):
-                email = st.text_input("Email", placeholder="Email address", max_chars=254, label_visibility="collapsed")
-                submitted = st.form_submit_button("Send reset link", use_container_width=True)
-            if submitted:
-                ok, msg = auth.send_reset(email)
-                (st.success if ok else st.error)(msg)
-            switch("Back to log in", "login", "auth_switch")
-
-        else:
-            with st.form("login_form", border=False):
-                email = st.text_input("Email", placeholder="Email", max_chars=254, label_visibility="collapsed")
-                password = st.text_input("Password", type="password", placeholder="Password",
-                                         max_chars=128, label_visibility="collapsed")
-                submitted = st.form_submit_button("Log in", use_container_width=True)
-            if submitted:
-                with st.spinner("Logging in…"):
-                    ok, msg = auth.login(email, password)
-                if ok:
-                    st.rerun()
-                st.error(msg)
-            switch("Forgot password?", "reset", "auth_forgot")
-            switch("Don't have an account? Sign up", "signup", "auth_switch")
-
-    st.markdown('<p class="legal">Your PDFs stay in this session only.</p>', unsafe_allow_html=True)
 
 
 user = auth.current_user()
 if user is None:
-    render_login()
+    login_view.render()
     st.stop()
+if "pending_cookie" in st.session_state:
+    session.write_cookie(st.session_state.pop("pending_cookie"))  # "keep me signed in" was ticked
 
-# ---------------------------------------------------------------- state (per session, item 7)
+# ---------------------------------------------------------------- chat state (per session, item 7)
 # The "current chat" lives in these keys; finished chats are kept in st.session_state.chats
 # (session only: nothing is written to disk or a database).
 CHAT_FIELDS = ("messages", "retriever", "doc_name", "docs", "chat_history_store")
@@ -156,84 +95,13 @@ MAX_DOCS = 5             # PDFs per chat
 MAX_TOTAL_CHUNKS = 4000  # keeps a multi-PDF chat as fast as one large PDF
 
 for k, v in {"messages": [], "retriever": None, "doc_name": None, "docs": [], "to_answer": None,
-             "answer_model": None, "chats": {}}.items():
+             "answer_model": None, "answer_receipt": None, "chats": {}}.items():
     st.session_state.setdefault(k, v)
 st.session_state.setdefault("chat_history_store", InMemoryChatMessageHistory())
 st.session_state.setdefault("chat_id", uuid.uuid4().hex)
+st.session_state.setdefault("view", "chat")          # "chat" or "settings"
+st.session_state.setdefault("settings_tab", "usage")  # usage, account, privacy, terms, admin
 USER_KEY = user["uid"] or user["email"]
-register_model_limits({m: MODEL_DAILY_LIMITS.get(m, (50, 500)) for m in AVAILABLE_MODELS})
-
-
-def model_name(model: str) -> str:
-    return AVAILABLE_MODELS.get(model, (model,))[0]
-
-
-def model_paused_for(model: str) -> int:
-    """Seconds until a model the provider rate-limited can be used again (0 = available)."""
-    return limiter().blocked_for(f"model:{model}")
-
-
-def model_headroom(model: str) -> float:
-    """Share of capacity left (0..1): the tighter of the app-wide budget and this user's allowance; -1 if paused."""
-    if model_paused_for(model):
-        return -1.0
-    shares = []
-    for kind, key in ((f"app_model_day:{model}", "app"), (f"model_day:{model}", USER_KEY)):
-        u = limiter().usage(kind, key)
-        shares.append((u["limit"] - u["used"]) / u["limit"])
-    return min(shares)
-
-
-def best_model() -> str:
-    """The model with the most capacity left; ties go to the preferred default (GROQ_MODEL)."""
-    preferred = default_model()
-    order = sorted(AVAILABLE_MODELS, key=lambda m: m != preferred)  # preferred first, then menu order
-    return max(order, key=model_headroom)  # max() keeps the first of equal scores
-
-
-def user_model_lock():
-    """
-    (model, seconds) if this user has used up their own allowance on any model; else None.
-    While locked the user can't use or switch to any model, so switching can't get around the limits.
-    """
-    for model in AVAILABLE_MODELS:
-        u = limiter().usage(f"model_day:{model}", USER_KEY)
-        if u["used"] >= u["limit"]:
-            return model, u["next_free_in"]
-    return None
-
-
-def lock_message(lock) -> str:
-    model, wait = lock
-    return (f"You've reached your daily limit on {model_name(model)}, so all models are paused for you "
-            f"until it resets in {wait_text(wait)}.")
-
-
-def reserve_question(model: str):
-    """
-    Takes one question from the user's overall allowance and from this model's own allowance.
-    Never switches model: if this one is out of quota, the question is refused. Returns (ok, message).
-    """
-    lock = user_model_lock()
-    if lock:
-        return False, lock_message(lock)
-    paused = model_paused_for(model)
-    if paused:
-        return False, f"{model_name(model)} has reached its usage limit. It resets in {wait_text(paused)}."
-    ok, message = limiter().take(f"model:{model}", USER_KEY, label=model_name(model))
-    if not ok:
-        return False, message
-    ok, message = limiter().take("question", USER_KEY)
-    if not ok:
-        limiter().undo(f"model:{model}", USER_KEY)  # nothing was asked, so give the model allowance back
-        return False, message
-    return True, None
-
-
-def release_question(model: str):
-    """Refunds a reserved question when no answer could be produced."""
-    limiter().undo(f"model:{model}", USER_KEY)
-    limiter().undo("question", USER_KEY)
 
 
 def get_session_history(session_id: str):
@@ -255,6 +123,7 @@ def save_current_chat():
     saved = ss.chats.get(ss.chat_id, {})
     ss.chats[ss.chat_id] = {
         **{f: ss[f] for f in CHAT_FIELDS},
+        "doc_names": [d["name"] for d in ss.docs] or saved.get("doc_names", []),
         "title": saved["title"] if saved.get("custom_title") else chat_title(ss.messages),
         "custom_title": saved.get("custom_title", False),
         "updated": saved.get("updated", time.time()) if saved.get("count") == len(ss.messages) else time.time(),
@@ -262,6 +131,91 @@ def save_current_chat():
     }
     while len(ss.chats) > MAX_CHATS:  # drop the oldest
         ss.chats.pop(min(ss.chats, key=lambda c: ss.chats[c]["updated"]))
+
+
+# ---------------------------------------------------------------- Recents (saved to Firestore, text only)
+STORE_UID = str(USER_KEY).replace("/", "_")  # Firestore document ids can't contain "/"
+
+
+# ---------------------------------------------------------------- terms of service gate
+def require_terms():
+    """Everyone accepts the current Terms once (again when they change) before using the app."""
+    ss = st.session_state
+    if ss.get("terms_ok"):
+        return
+    if store.accepted_terms(STORE_UID) == legal.TERMS_VERSION:  # one read per login
+        ss.terms_ok = True
+        return
+    with st.container(key="legal_page"):
+        st.markdown(legal.terms())
+        with st.expander("Privacy Policy"):
+            st.markdown(legal.privacy())
+        agreed = st.checkbox("I agree to the Terms of Service and Privacy Policy", key="gate_agree")
+        if st.button("Continue", key="gate_continue", type="primary", disabled=not agreed):
+            store.accept_terms(STORE_UID, legal.TERMS_VERSION)
+            ss.terms_ok = True
+            st.rerun()
+    st.stop()
+
+
+require_terms()
+
+
+def history_from(messages: list) -> InMemoryChatMessageHistory:
+    """Rebuilds the model's short-term memory (last 3 exchanges) from saved messages."""
+    history = InMemoryChatMessageHistory()
+    pairs, question = [], None
+    for m in messages:
+        if m["role"] == "user" and m.get("content"):
+            question = m["content"]
+        elif m.get("kind") == "answer" and question:
+            pairs.append((question, m["content"]))
+            question = None
+    for q, a in pairs[-3:]:
+        history.add_user_message(q)
+        history.add_ai_message(a)
+    return history
+
+
+def load_saved_chats():
+    """Once per login: puts the user's 20 most recent saved chats into Recents."""
+    ss = st.session_state
+    if ss.get("chats_loaded"):
+        return
+    ss.chats_loaded = True
+    ss.setdefault("saved_signatures", {})
+    for c in store.load_chats(STORE_UID):
+        msgs = c.get("messages", [])
+        names = c.get("doc_names", [])
+        ss.chats[c["id"]] = {
+            "messages": msgs, "retriever": None, "docs": [], "doc_names": names,
+            "doc_name": ", ".join(names) or None, "chat_history_store": history_from(msgs),
+            "title": c.get("title", "Chat"), "custom_title": c.get("custom_title", False),
+            "updated": c.get("updated", 0), "count": len(msgs),
+        }
+        ss.saved_signatures[c["id"]] = chat_signature(ss.chats[c["id"]])
+
+
+def chat_signature(chat: dict) -> tuple:
+    """Changes whenever something worth saving changes: messages, title or a feedback vote."""
+    return (chat["count"], chat["title"], tuple(m.get("rating") for m in chat["messages"]))
+
+
+def persist_current_chat():
+    """Updates Recents and, if the open chat changed, saves it to Firestore (one background write)."""
+    ss = st.session_state
+    save_current_chat()
+    if not store.enabled() or not ss.messages:
+        return
+    chat = ss.chats.get(ss.chat_id)
+    if not chat:
+        return
+    sig = chat_signature(chat)
+    if ss.setdefault("saved_signatures", {}).get(ss.chat_id) == sig:
+        return
+    ss.saved_signatures[ss.chat_id] = sig
+    store.save_in_background(store.save_chat, STORE_UID, ss.chat_id, chat["title"], list(chat["messages"]),
+                             chat.get("doc_names", []), chat.get("custom_title", False), chat["updated"])
 
 
 def reset_current_chat():
@@ -272,17 +226,20 @@ def reset_current_chat():
     st.session_state.to_answer = None
     st.session_state.chat_history_store = InMemoryChatMessageHistory()  # new object: old chats keep theirs
     st.session_state.chat_id = uuid.uuid4().hex
+    st.session_state.doc_names = []
 
 
 def new_chat():
     save_current_chat()
     reset_current_chat()
     if not st.session_state.get("model_chosen"):
-        st.session_state.model_pick = best_model()  # spread usage across models
+        st.session_state.model_pick = quota.best_model(USER_KEY)  # spread usage across models
 
 
 def delete_chat(chat_id: str):
     st.session_state.chats.pop(chat_id, None)
+    st.session_state.get("saved_signatures", {}).pop(chat_id, None)
+    store.save_in_background(store.delete_chat, STORE_UID, chat_id)
     if chat_id == st.session_state.chat_id:
         reset_current_chat()  # not saved again: it's gone
 
@@ -301,9 +258,11 @@ def open_chat(chat_id: str):
         st.session_state[f] = chat.get(f, defaults.get(f, InMemoryChatMessageHistory()))
     st.session_state.to_answer = None
     st.session_state.chat_id = chat_id
+    st.session_state.doc_names = chat.get("doc_names", [])
 
 
 # A 300-page PDF's index is roughly 25 MB (3,072-dim vectors), so caches stay small for ~1 GB hosts.
+# ---------------------------------------------------------------- documents (PDF → search index)
 @st.cache_resource(show_spinner=False, max_entries=8, ttl=1800)
 def process_pdf(_file_bytes: bytes, filename: str, file_hash: str, _allow_ocr=None):
     """Builds the index once per unique file. The temp copy is deleted immediately."""
@@ -338,6 +297,7 @@ def attach_pdf(file_name: str, file_hash: str, index) -> str | None:
     return None
 
 
+# ---------------------------------------------------------------- answers
 def say(text: str, **extra):
     st.session_state.messages.append({"role": "assistant", "content": text, **extra})
 
@@ -367,12 +327,12 @@ def stream_answer(question: str, model: str):
                     box.markdown(stream_preview(text) + " ▍")
                     last_draw = now
     except Exception as e:
-        release_question(model)  # no answer, so this question doesn't count
+        quota.release(model, USER_KEY, st.session_state.answer_receipt)  # no answer, so it doesn't count
         if is_rate_limit(e):
             wait = retry_after_seconds(e)
             limiter().block(f"model:{model}", wait)
             log.warning("model=%s rate-limited by provider for %ss", model, wait)
-            text = f"{model_name(model)} has reached its usage limit. It resets in {wait_text(wait)}."
+            text = f"{quota.model_name(model)} has reached its usage limit. It resets in {wait_text(wait)}."
         else:
             log.exception("Answer generation failed")
             text = "I couldn't get an answer just now. Please try again."
@@ -394,8 +354,11 @@ def save_feedback(index: int, key: str):
     msg = msgs[index]
     msg["rating"] = rating
     question = next((m.get("content") for m in reversed(msgs[:index]) if m["role"] == "user" and m.get("content")), "")
-    stats().record_feedback({"rating": rating, "question": question[:500], "answer": msg["content"][:2000],
-                             "model": msg.get("model"), "sources": msg.get("sources", "")})
+    entry = {"rating": rating, "question": question[:500], "answer": msg["content"][:2000],
+             "model": msg.get("model"), "sources": msg.get("sources", "")}
+    stats().record_feedback(entry)
+    store.save_in_background(store.add_feedback, {**entry, "uid": STORE_UID,
+                                                  "time": time.strftime("%Y-%m-%dT%H:%M:%S")})
 
 
 def feedback_widget(index: int):
@@ -427,16 +390,17 @@ def regenerate_last():
     question = next((m["content"] for m in reversed(msgs) if m["role"] == "user" and m.get("content")), None)
     if not question or msgs[-1].get("kind") != "answer":
         return
-    ok, message = reserve_question(st.session_state.model_pick)
+    ok, result = quota.reserve(st.session_state.model_pick, USER_KEY)
     if not ok:
-        return say(message)  # keep the old answer if we can't make a new one
-    st.session_state.answer_model = st.session_state.model_pick
+        return say(result)  # keep the old answer if we can't make a new one
+    st.session_state.answer_model, st.session_state.answer_receipt = st.session_state.model_pick, result
     msgs.pop()
     history = st.session_state.chat_history_store
     history.messages = history.messages[:-2]  # the last question/answer pair
     st.session_state.to_answer = question
 
 
+# ---------------------------------------------------------------- user input (questions and attachments)
 def add_pdf(pdf) -> bool:
     """Validates, indexes and attaches one uploaded PDF. Reports problems in the chat; True if it was added."""
     file_name = clean_text(pdf.name, 120)
@@ -446,13 +410,14 @@ def add_pdf(pdf) -> bool:
         return False
     data = pdf.getvalue()
     file_hash = hashlib.sha256(data).hexdigest()
-    ocr_taken = []
+    ocr_receipts = []
 
     def take_ocr():
-        ok, msg = limiter().take("ocr", USER_KEY)
-        if ok:
-            ocr_taken.append(True)
-        return ok, msg
+        ok, result = limiter().take("ocr", USER_KEY)
+        if not ok:
+            return False, result
+        ocr_receipts.append(result)
+        return True, None
 
     try:
         validate_pdf(data)
@@ -460,8 +425,8 @@ def add_pdf(pdf) -> bool:
             # A scanned PDF only spends OCR quota if it actually needs OCR (checked inside)
             index = process_pdf(data, file_name, file_hash, take_ocr)
     except Exception as e:
-        if ocr_taken:
-            limiter().undo("ocr", USER_KEY)  # the read failed, so it shouldn't count
+        for receipt in ocr_receipts:
+            limiter().undo("ocr", USER_KEY, receipt)  # the read failed, so it shouldn't count
         if isinstance(e, ValueError):  # our own, user-safe messages
             say(f"I couldn't use **{file_name}**. {e}")
         else:
@@ -505,222 +470,14 @@ def handle_submission(text: str, files):
     if st.session_state.retriever is None:
         return say("Attach a PDF with the **+** button first, then ask your question.")
 
-    ok, message = reserve_question(st.session_state.model_pick)
+    ok, result = quota.reserve(st.session_state.model_pick, USER_KEY)
     if not ok:
-        return say(message)
-    st.session_state.answer_model = st.session_state.model_pick
+        return say(result)
+    st.session_state.answer_model, st.session_state.answer_receipt = st.session_state.model_pick, result
     st.session_state.to_answer = text
 
 
-# ---------------------------------------------------------------- settings
-st.session_state.setdefault("view", "chat")          # "chat" or "settings"
-st.session_state.setdefault("settings_tab", "usage")  # "usage" or "account"
-
-USAGE_CARDS = [  # (title, limit kind) on Settings → Usage → Overview
-    ("Daily limit", "question_day"),
-    ("Short-term limit (10 minutes)", "question"),
-]
-
-
-def visitor_timezone():
-    """The browser's time zone (Streamlit >= 1.44), so charts show local hours even on a UTC server."""
-    try:
-        return ZoneInfo(st.context.timezone)
-    except Exception:
-        return timezone.utc
-
-
-def duration_text(seconds: int) -> str:
-    h, m = divmod(max(0, seconds) // 60, 60)
-    return f"{h}h {m}m" if h else f"{m}m" if m else f"{max(1, seconds)}s"
-
-
-def usage_card(title: str, kind: str, key: str | None = None) -> str:
-    u = limiter().usage(kind, key or USER_KEY)
-    left_pct = max(0, round(100 * (u["limit"] - u["used"]) / u["limit"]))
-    reset = f"Resets in {duration_text(u['full_reset_in'])}" if u["used"] else "Full allowance available"
-    level = "full" if left_pct == 0 else "low" if left_pct <= 20 else ""
-    return (
-        f'<div class="set-card"><div class="set-card-title">{title}</div>'
-        f'<div class="set-row"><span>{reset}</span><span>{left_pct}% remaining</span></div>'
-        f'<div class="set-bar {level}"><i style="width:{left_pct}%"></i></div></div>'
-    )
-
-
-def model_card(model: str) -> str:
-    paused = model_paused_for(model)
-    if not paused:
-        return usage_card(model_name(model), f"model_day:{model}")
-    return (  # paused by the provider for everyone: show it as empty until the reset
-        f'<div class="set-card"><div class="set-card-title">{html.escape(model_name(model))}</div>'
-        f'<div class="set-row"><span>Usage limit reached. Resets in {duration_text(paused)}</span><span>0% remaining</span></div>'
-        f'<div class="set-bar full"><i style="width:0%"></i></div></div>'
-    )
-
-
-def session_answers() -> list[dict]:
-    """Every answer in this session's chats (current chat included, counted once)."""
-    ss = st.session_state
-    chats = {cid: c["messages"] for cid, c in ss.chats.items()}
-    chats[ss.chat_id] = ss.messages
-    return [m for msgs in chats.values() for m in msgs if m.get("kind") == "answer"]
-
-
-def render_analytics():
-    answers = session_answers()
-    timed = [m["seconds"] for m in answers if m.get("seconds")]
-    models = [AVAILABLE_MODELS.get(m["model"], (m["model"],))[0] for m in answers if m.get("model")]
-    used_today = limiter().usage("question_day", USER_KEY)["used"]
-    tiles = [
-        ("Questions today", str(used_today)),
-        ("Answers this session", str(len(answers))),
-        ("Average answer time", f"{sum(timed) / len(timed):.1f}s" if timed else "–"),
-        ("Most used model", max(set(models), key=models.count) if models else "–"),
-    ]
-    st.markdown(
-        '<div class="set-page"><h2>Your activity</h2><p>Based on today’s questions and this session’s chats.</p>'
-        '<div class="set-tiles">'
-        + "".join(f'<div class="set-tile"><span>{k}</span><b>{html.escape(v)}</b></div>' for k, v in tiles)
-        + "</div></div>",
-        unsafe_allow_html=True,
-    )
-    times = limiter().events("question_day", USER_KEY)
-    if times:
-        now = time.time()
-        hours_ago = [int((now - t) // 3600) for t in times]
-        df = pd.DataFrame({"hours_ago": list(range(23, -1, -1))})
-        df["Questions"] = [hours_ago.count(h) for h in df["hours_ago"]]
-        tz = visitor_timezone()
-        df["Hour"] = [datetime.fromtimestamp(now - h * 3600, tz).strftime("%H:00") for h in df["hours_ago"]]
-        chart = (
-            alt.Chart(df).mark_bar(cornerRadiusTopLeft=3, cornerRadiusTopRight=3, color="#3B82F6")
-            .encode(x=alt.X("Hour:N", sort=None, title=None, axis=alt.Axis(labelAngle=0, labelOverlap=True)),
-                    y=alt.Y("Questions:Q", title=None, axis=alt.Axis(tickMinStep=1)),
-                    tooltip=["Hour", "Questions"])
-            .properties(height=220, title=alt.Title("Questions in the last 24 hours", anchor="start"))
-            .configure(background="transparent").configure_view(strokeWidth=0)
-            .configure_title(fontSize=14, fontWeight=600)
-        )
-        with st.container(key="set_chart"):
-            st.altair_chart(chart, use_container_width=True)
-    else:
-        st.markdown('<div class="set-page"><p>No questions yet today. Your activity will show up here.</p></div>',
-                    unsafe_allow_html=True)
-
-
-def render_admin():
-    """Owner-only overview of the whole app. Access is checked again here, on the server."""
-    if not is_admin(user["email"]):
-        st.session_state.settings_tab = "usage"
-        return render_settings()
-    snap = stats().snapshot()
-    answers = snap["answers"]
-    total = sum(a["count"] for a in answers.values())
-    errors = sum(a["errors"] for a in answers.values())
-    secs = sum(a["seconds"] for a in answers.values())
-    ratings = [f["rating"] for f in snap["feedback"]]
-    tiles = [
-        ("Running for", duration_text(int(snap["uptime"]))),
-        ("Answers", str(total)),
-        ("Average answer time", f"{secs / total:.1f}s" if total else "–"),
-        ("Errors", str(errors)),
-        ("Helpful answers", f"{round(100 * sum(ratings) / len(ratings))}%" if ratings else "–"),
-    ]
-    app_cards = [("Questions today, all users", "app_question_day"), ("Uploads today, all users", "app_upload_day"),
-                 ("Scanned PDFs today, all users", "app_ocr_day")]
-    model_rows = ""
-    for m in MODEL_IDS:
-        a = answers.get(m, {})
-        n = a.get("count", 0)
-        avg = f"{a['seconds'] / n:.1f}s" if n else "–"
-        model_rows += (f"<tr><td>{html.escape(model_name(m))}</td><td>{n}</td><td>{avg}</td>"
-                       f"<td>{a.get('errors', 0)}</td></tr>")
-    st.markdown(
-        '<div class="set-page"><h1>Admin</h1><p>Only visible to emails in <code>ADMIN_EMAILS</code>. '
-        "Counters cover all users since the app last started.</p>"
-        '<div class="set-tiles">'
-        + "".join(f'<div class="set-tile"><span>{k}</span><b>{html.escape(v)}</b></div>' for k, v in tiles)
-        + '</div><h2>App-wide limits</h2>'
-        + "".join(usage_card(t, k, key="app") for t, k in app_cards)
-        + "".join(model_card_app(m) for m in MODEL_IDS)
-        + '<h2 class="set-h2-gap">Models</h2><table class="set-table"><tr><th>Model</th><th>Answers</th>'
-        "<th>Avg time</th><th>Errors</th></tr>" + model_rows + "</table>"
-        + '<h2 class="set-h2-gap">Recent feedback</h2>'
-        + ("".join(
-            f'<div class="set-fb"><span>{"👍" if f["rating"] else "👎"}</span><div><b>{html.escape(f["question"] or "(no question)")}</b>'
-            f'<small>{html.escape(model_name(f.get("model") or ""))}, {html.escape(f["time"])}</small></div></div>'
-            for f in snap["feedback"][:20]) or "<p>No feedback yet.</p>")
-        + "</div>",
-        unsafe_allow_html=True,
-    )
-    if snap["feedback"]:
-        with st.container(key="set_logout"):
-            st.download_button("Download feedback (JSONL)", "\n".join(json.dumps(f, ensure_ascii=False) for f in snap["feedback"]),
-                               file_name="feedback.jsonl", mime="application/json", icon=":material/download:")
-
-
-def model_card_app(model: str) -> str:
-    paused = model_paused_for(model)
-    title = f"{model_name(model)}, all users"
-    if not paused:
-        return usage_card(title, f"app_model_day:{model}", key="app")
-    return (f'<div class="set-card"><div class="set-card-title">{html.escape(title)}</div>'
-            f'<div class="set-row"><span>Paused by the provider. Resets in {duration_text(paused)}</span>'
-            f'<span>0% remaining</span></div><div class="set-bar full"><i style="width:0%"></i></div></div>')
-
-
-def render_settings():
-    tab = st.session_state.settings_tab
-    if tab == "admin":
-        return render_admin()
-    if tab == "account":
-        method = {"google": "Google", "firebase": "Email and password"}.get(user.get("method"), "Email and password")
-        rows = [("Name", user["name"]), ("Email", user["email"]), ("Signed in with", method)]
-        st.markdown(
-            '<div class="set-page"><h1>Account</h1><div class="set-card">'
-            + "".join(f'<div class="set-kv"><span>{k}</span><span>{html.escape(v)}</span></div>' for k, v in rows)
-            + "</div></div>",
-            unsafe_allow_html=True,
-        )
-        with st.container(key="set_logout"):
-            if st.button("Log out", icon=":material/logout:", key="set_logout_btn"):
-                auth.logout()
-                st.rerun()
-        return
-    st.markdown('<div class="set-page"><h1>Usage</h1></div>', unsafe_allow_html=True)
-    with st.container(key="usage_tabs"):
-        view = st.segmented_control("View", ["Overview", "Analytics"], default="Overview",
-                                    key="usage_view", label_visibility="collapsed") or "Overview"
-    if view == "Analytics":
-        return render_analytics()
-    st.markdown(
-        '<div class="set-page"><h2>Question limits</h2>'
-        "<p>Shared across all your chats and PDFs. These limits keep the app’s AI quota from running out "
-        "for everyone; each one refills gradually after you use it.</p>"
-        + "".join(usage_card(t, k) for t, k in USAGE_CARDS)
-        + "<h2 class=\"set-h2-gap\">Model limits</h2>"
-        "<p>Each model has its own daily allowance. If you use up any one of them, all models are paused "
-        "for you until it resets, so the limits can't be bypassed by switching models.</p>"
-        + (f'<div class="set-alert">{html.escape(lock_message(user_model_lock()))}</div>' if user_model_lock() else "")
-        + "".join(model_card(m) for m in MODEL_IDS)
-        + "</div>",
-        unsafe_allow_html=True,
-    )
-
-
-def settings_sidebar():
-    with st.container(key="settings_nav"):
-        if st.button("Back to app", icon=":material/arrow_back:", key="set_back", use_container_width=True):
-            st.session_state.view = "chat"
-            st.rerun()
-        st.markdown('<p class="side-label">Settings</p>', unsafe_allow_html=True)
-        tabs = [("usage", "Usage", ":material/speed:"), ("account", "Account", ":material/person:")]
-        if is_admin(user["email"]):
-            tabs.append(("admin", "Admin", ":material/admin_panel_settings:"))
-        for tab, label, icon in tabs:
-            if st.button(label, icon=icon, key=f"set_{tab}", use_container_width=True):
-                st.session_state.settings_tab = tab
-                st.rerun()
+# ---------------------------------------------------------------- profile row
 
 
 def avatar_css(name: str) -> str:
@@ -742,15 +499,10 @@ def email_css(email: str) -> str:
     return f'.st-key-profile [data-testid="stPopover"] button p::after {{ content: "{safe}"; }}'
 
 
-# ---------------------------------------------------------------- composer
-MODEL_IDS = list(AVAILABLE_MODELS)
-if default_model() not in MODEL_IDS:  # a custom GROQ_MODEL from .env is still offered
-    AVAILABLE_MODELS[default_model()] = (default_model().split("/")[-1], "Set in your .env")
-    MODEL_IDS.insert(0, default_model())
-    register_model_limits({default_model(): (50, 500)})
+# ---------------------------------------------------------------- composer and model menu
 # Start on whichever model has the most capacity left, unless the user picked one this session
 st.session_state.setdefault("model_chosen", False)
-st.session_state.setdefault("model_pick", best_model())
+st.session_state.setdefault("model_pick", quota.best_model(USER_KEY))
 
 
 def composer(key: str, placeholder: str):
@@ -761,41 +513,37 @@ def composer(key: str, placeholder: str):
 def model_menu():
     """Model picker in the top-left of the chat area, like ChatGPT's."""
     with st.container(key="model_top"):
-        lock = user_model_lock()
+        lock = quota.user_lock(USER_KEY)
         with st.popover(AVAILABLE_MODELS[st.session_state.model_pick][0]):
             if lock:
-                st.markdown(f'<p class="model-lock">{html.escape(lock_message(lock))}</p>', unsafe_allow_html=True)
+                st.markdown(f'<p class="model-lock">{html.escape(quota.lock_message(lock))}</p>',
+                            unsafe_allow_html=True)
             st.radio(
                 "Model", MODEL_IDS, key="model_pick", label_visibility="collapsed", disabled=bool(lock),
                 on_change=lambda: st.session_state.update(model_chosen=True),
                 format_func=lambda m: AVAILABLE_MODELS[m][0],
-                captions=[model_caption(m) for m in MODEL_IDS],
+                captions=[quota.caption(m, USER_KEY) for m in MODEL_IDS],
             )
 
 
-def model_caption(model: str) -> str:
-    """Model description, or why it can't be used right now."""
-    paused = model_paused_for(model)
-    if paused:
-        return f"Limit reached, resets in {duration_text(paused)}"
-    u = limiter().usage(f"model_day:{model}", USER_KEY)
-    if u["used"] >= u["limit"]:
-        return f"Daily limit reached, resets in {duration_text(u['full_reset_in'])}"
-    return AVAILABLE_MODELS[model][1]
+# What the settings pages need to know about the signed-in user
+SETTINGS = settings_view.Ctx(user=user, user_key=USER_KEY, store_uid=STORE_UID, save_chat=save_current_chat)
 
 
 # ---------------------------------------------------------------- sidebar
 with st.sidebar:
     if st.session_state.view == "settings":
-        settings_sidebar()
+        settings_view.sidebar(SETTINGS)
     else:
-        st.markdown('<div class="brand">Ask your PDF</div>', unsafe_allow_html=True)
-        save_current_chat()
+        st.markdown(f'<div class="brand">{logo_svg(22)}<span>Ask your PDF</span></div>', unsafe_allow_html=True)
+        load_saved_chats()
+        persist_current_chat()
         ss = st.session_state
         # Highlight the open chat in Recents (New chat only highlights on hover)
         if ss.messages:
             st.markdown(f"<style>.st-key-recents .st-key-chat_{ss.chat_id} button,"
-                        f".st-key-recents .st-key-chat_{ss.chat_id} button:focus {{ background: var(--hover) !important;"
+                        f".st-key-recents .st-key-chat_{ss.chat_id} button:focus"
+                        f" {{ background: var(--hover) !important;"
                         f" padding-right: 2.2rem !important; }}</style>",
                         unsafe_allow_html=True)
 
@@ -839,7 +587,7 @@ with st.sidebar:
 
 # ---------------------------------------------------------------- main
 if st.session_state.view == "settings":
-    render_settings()
+    settings_view.render(SETTINGS)
     st.stop()
 
 submission = None
@@ -856,6 +604,11 @@ else:
     if st.session_state.doc_name:
         st.markdown(f'<div class="doc-title">Chatting about <b>{html.escape(st.session_state.doc_name)}</b></div>',
                     unsafe_allow_html=True)
+    if st.session_state.retriever is None and st.session_state.get("doc_names"):
+        st.markdown(
+            '<div class="reattach">PDFs aren’t stored, only the chat text. To ask follow-up questions, attach '
+            f'<b>{html.escape(", ".join(st.session_state.doc_names))}</b> again with <b>+</b>.</div>',
+            unsafe_allow_html=True)
 
     for i, msg in enumerate(st.session_state.messages):
         with st.chat_message(msg["role"]):
@@ -890,6 +643,7 @@ else:
                 feedback_widget(len(st.session_state.messages))  # index the answer is about to get
         say(answer, sources=sources, followups=followups, kind="answer" if docs else "notice",
             model=used, seconds=round(seconds, 1))
+        persist_current_chat()  # save right away, even if the user closes the tab now
 
     # Actions under the latest answer: follow-up suggestions, regenerate, export
     last = st.session_state.messages[-1] if st.session_state.messages else {}

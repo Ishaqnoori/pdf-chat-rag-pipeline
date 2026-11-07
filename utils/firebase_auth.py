@@ -16,7 +16,8 @@ FRIENDLY_ERRORS = {
     "EMAIL_EXISTS": "An account with this email already exists. Log in instead.",
     "INVALID_EMAIL": "Enter a valid email address.",
     "WEAK_PASSWORD": "Password is too weak. Use at least 8 characters.",
-    "PASSWORD_DOES_NOT_MEET_REQUIREMENTS": "Password doesn't meet the requirements. Try a longer one with mixed characters.",
+    "PASSWORD_DOES_NOT_MEET_REQUIREMENTS":
+        "Password doesn't meet the requirements. Try a longer one with mixed characters.",
     "INVALID_LOGIN_CREDENTIALS": "Incorrect email or password.",
     "EMAIL_NOT_FOUND": "Incorrect email or password.",
     "INVALID_PASSWORD": "Incorrect email or password.",
@@ -79,6 +80,11 @@ def sign_in(email: str, password: str) -> dict:
 
 def send_verification(id_token: str) -> None:
     _post("sendOobCode", {"requestType": "VERIFY_EMAIL", "idToken": id_token})
+
+
+def delete_account(id_token: str) -> None:
+    """Permanently deletes the signed-in Firebase account."""
+    _post("delete", {"idToken": id_token})
 
 
 def send_password_reset(email: str) -> None:

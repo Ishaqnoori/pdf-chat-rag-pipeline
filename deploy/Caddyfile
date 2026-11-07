@@ -1,0 +1,20 @@
+# Self-hosting on your own server (VPS): Caddy gets a free HTTPS certificate automatically and adds
+# the security headers Streamlit can't set itself (items 18 and 19). Replace the domain with yours.
+ask-your-pdf.example.com {
+    encode gzip
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "SAMEORIGIN"
+        Referrer-Policy "strict-origin-when-cross-origin"
+        Permissions-Policy "camera=(), microphone=(), geolocation=()"
+        # Enforced now: safe with Streamlit.
+        Content-Security-Policy "frame-ancestors 'self'; object-src 'none'; base-uri 'self'; form-action 'self'"
+        # Full policy in report-only mode: the browser logs violations (DevTools console) without blocking.
+        # Once a week of normal use shows no violations, rename it to Content-Security-Policy to enforce it.
+        # Streamlit itself needs 'unsafe-inline' and 'unsafe-eval'; everything else is locked to this site.
+        Content-Security-Policy-Report-Only "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' wss: https:; frame-src 'self' blob: data:; worker-src 'self' blob:; object-src 'none'; base-uri 'self'; frame-ancestors 'self'; form-action 'self'"
+        -Server
+    }
+    reverse_proxy app:8501
+}

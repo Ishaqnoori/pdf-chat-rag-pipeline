@@ -15,3 +15,5 @@ __pycache__/
 tests/
 *.bat
 *.ps1
+firebase-service-account.json
+*service-account*.json

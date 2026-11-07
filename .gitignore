@@ -22,3 +22,7 @@ eval/testset.json
 
 # Answer feedback (contains questions/answers about users' documents)
 data/feedback.jsonl
+
+# Firebase service-account key: full admin access, never commit
+firebase-service-account.json
+*service-account*.json

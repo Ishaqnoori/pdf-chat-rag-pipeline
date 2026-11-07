@@ -37,3 +37,18 @@ def test_sources_label():
     assert sources_label([Doc("a.pdf", 0), Doc("a.pdf", 1)]) == "Pages 1, 2"
     assert sources_label([Doc("a.pdf", 0), Doc("b.pdf", 2)]) == "a.pdf p. 1; b.pdf p. 3"
     assert sources_label([]) == ""
+
+
+def test_google_rate_limit_errors_are_understood():
+    class ResourceExhausted(Exception):
+        pass
+    error = ResourceExhausted("429 Quota exceeded for metric generate_content. Please retry in 23.4s.")
+    assert is_rate_limit(error)
+    assert retry_after_seconds(error) == 24
+    assert retry_after_seconds(Exception('"retryDelay": "41s"')) == 41
+
+
+def test_every_model_has_limits_and_a_provider():
+    from utils.llm import AVAILABLE_MODELS, MODEL_DAILY_LIMITS, PROVIDERS
+    for model in AVAILABLE_MODELS:
+        assert model in MODEL_DAILY_LIMITS and PROVIDERS[model] in ("groq", "google")

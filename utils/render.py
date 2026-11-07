@@ -4,6 +4,7 @@ Renders an LLM answer in Streamlit: Markdown (headings, lists, tables) plus
 """
 import json
 import re
+from functools import lru_cache
 
 import altair as alt
 import pandas as pd
@@ -92,22 +93,38 @@ def _build_chart(spec: dict):
     )
 
 
-def render_answer(text: str):
-    """Writes the (sanitised) answer to the current Streamlit container."""
+@lru_cache(maxsize=256)
+def _parse_answer(text: str) -> tuple:
+    """
+    Splits an answer into ("md", markdown) and ("chart", chart_or_None) parts. Cached: Streamlit
+    re-runs on every click, and without this every past answer (and chart) would be rebuilt each time.
+    """
     text = sanitize_markdown(text)
-    pos = 0
+    parts, pos = [], 0
     for m in CHART_BLOCK.finditer(text):
         before = text[pos:m.start()].strip()
         if before:
-            st.markdown(_fix_tables(before))
+            parts.append(("md", _fix_tables(before)))
         try:
-            st.altair_chart(_build_chart(json.loads(m.group(1))), use_container_width=True)
+            parts.append(("chart", _build_chart(json.loads(m.group(1)))))
         except Exception:
-            st.caption("A chart was suggested for this answer but its data couldn't be drawn.")
+            parts.append(("chart", None))
         pos = m.end()
     rest = text[pos:].strip()
     if rest:
-        st.markdown(_fix_tables(rest))
+        parts.append(("md", _fix_tables(rest)))
+    return tuple(parts)
+
+
+def render_answer(text: str):
+    """Writes the (sanitised) answer to the current Streamlit container."""
+    for kind, part in _parse_answer(text):
+        if kind == "md":
+            st.markdown(part)
+        elif part is not None:
+            st.altair_chart(part, use_container_width=True)
+        else:
+            st.caption("A chart was suggested for this answer but its data couldn't be drawn.")
 
 
 # ---------------------------------------------------------------- follow-ups & streaming

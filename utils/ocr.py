@@ -40,7 +40,8 @@ def ocr_pdf(data: bytes) -> list[tuple[int, str]]:
     try:
         r = requests.post(
             ENDPOINT.format(model=OCR_MODEL), json=payload, timeout=TIMEOUT,
-            headers={"x-goog-api-key": os.getenv("GOOGLE_API_KEY", "")},  # header, so the key never appears in URLs/logs
+            # The key goes in a header, so it never appears in URLs or logs
+            headers={"x-goog-api-key": os.getenv("GOOGLE_API_KEY", "")},
         )
     except requests.RequestException:
         raise ValueError("Couldn't reach the text-recognition service. Try again.")

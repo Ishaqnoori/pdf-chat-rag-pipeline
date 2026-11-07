@@ -1,0 +1,13 @@
+// Firestore security rules (item 4). Deploy them: Firebase console > Firestore > Rules > paste > Publish.
+//
+// Browsers get NO access at all. Only the app's server reads and writes, using the service-account
+// key, and it scopes every user's data to users/{their own uid}. So even someone holding the public
+// web API key can't read or change anyone's chats, counters or feedback.
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

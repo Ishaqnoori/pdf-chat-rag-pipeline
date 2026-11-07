@@ -14,8 +14,8 @@ Write-Host "Staging files..."
 git add .
 
 $tracked = git diff --cached --name-only
-if ($tracked -match '(^|/)\.env$' -or $tracked -match 'secrets\.toml$') {
-    Write-Host "STOP: .env or secrets.toml is staged. Check .gitignore." -ForegroundColor Red
+if ($tracked -match '(^|/)\.env$' -or $tracked -match 'secrets\.toml$' -or $tracked -match 'service-account.*\.json$') {
+    Write-Host "STOP: .env, secrets.toml or a service-account key is staged. Check .gitignore." -ForegroundColor Red
     git reset -q
     exit 1
 }
