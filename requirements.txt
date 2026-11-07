@@ -4,7 +4,7 @@
 # Core RAG
 langchain>=1.0.0,<2
 langchain-core>=1.0.0,<2
-langchain-community>=0.4.0,<0.5
+langchain-community>=0.4.2,<0.5
 langchain-text-splitters>=1.0.0,<2
 langchain-google-genai>=4.0.0,<5
 langchain-groq>=1.0.0,<2
