@@ -52,12 +52,14 @@ To keep them from running out:
 | PDF uploads per user | 10 per hour, 20 per day | `LIMIT_UPLOADS_PER_USER_DAY` |
 | Questions, whole app | 20 per minute, 800 per day | `LIMIT_APP_QUESTIONS_PER_MINUTE`, `LIMIT_APP_QUESTIONS_PER_DAY` |
 | Uploads, whole app | 150 per day | `LIMIT_APP_UPLOADS_PER_DAY` |
+| Questions per model, per user | GPT-OSS 120B 50, GPT-OSS 20B 100, Qwen 50 per day | `LIMIT_MODEL_GPT_OSS_120B`, `LIMIT_MODEL_GPT_OSS_20B`, `LIMIT_MODEL_QWEN_27B` |
+| Questions per model, whole app | 500 / 1,000 / 500 per day | `LIMIT_APP_MODEL_GPT_OSS_120B`, `LIMIT_APP_MODEL_GPT_OSS_20B`, `LIMIT_APP_MODEL_QWEN_27B` |
 | Scanned PDFs (OCR) | 5 per user, 40 for the app, per day | `LIMIT_SCANS_PER_USER_DAY`, `LIMIT_APP_SCANS_PER_DAY` |
 | Answer length | 2,048 tokens | `MAX_ANSWER_TOKENS` |
 
 Token savings: only the last 3 question/answer pairs are sent to the model, follow-up questions are
 rewritten by the small `gpt-oss-20b` model (separate quota), and identical PDFs are embedded only once.
-If a model hits its provider limit mid-request, the app retries once with another model.
+Each session (and each New chat) starts on the model with the most capacity left, unless the user picked one. If a user uses up their allowance on any one model, all models are paused for that user until it resets (the model menu is locked), so switching can't bypass limits. Models are never swapped automatically mid-request: when the chosen model is out of quota the question is refused with its reset time. If the provider rate-limits a model, it is paused for everyone until the provider's reset time, and the user's question is refunded.
 Counters are kept in memory, so they reset when the app restarts.
 
 ## Project structure

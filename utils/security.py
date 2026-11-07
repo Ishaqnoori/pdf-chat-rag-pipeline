@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import threading
+import uuid
 import time
 from collections import defaultdict, deque
 
@@ -68,12 +69,36 @@ QUOTAS = {
 }
 
 
+def register_model_limits(models: dict[str, tuple[int, int]]):
+    """
+    Per-model allowances: {model_id: (questions_per_user_per_day, questions_per_day_for_the_whole_app)}.
+    The app-wide budget keeps one model from using more than its share of the provider quota.
+    """
+    for model, (per_user, per_app) in models.items():
+        LIMITS[f"model_day:{model}"] = (per_user, DAY)
+        LIMITS[f"app_model_day:{model}"] = (per_app, DAY)
+        QUOTAS[f"model:{model}"] = [
+            (f"model_day:{model}", "user", "{model} has reached your daily limit of {limit} questions. It resets in {wait}."),
+            (f"app_model_day:{model}", "app", "{model} has used today's app-wide allowance. It resets in {wait}."),
+        ]
+
+
 class RateLimiter:
     """Sliding-window counter shared by every session on this server."""
 
     def __init__(self):
         self._hits = defaultdict(deque)
+        self._blocked_until: dict[str, float] = {}  # app-wide pauses, e.g. a model the provider rate-limited
         self._lock = threading.Lock()
+
+    def block(self, name: str, seconds: float):
+        with self._lock:
+            self._blocked_until[name] = max(self._blocked_until.get(name, 0), time.time() + seconds)
+
+    def blocked_for(self, name: str) -> int:
+        """Seconds left on an app-wide pause (0 if not paused)."""
+        with self._lock:
+            return max(0, int(self._blocked_until.get(name, 0) - time.time()))
 
     def check(self, kind: str, key: str, record: bool = True):
         """Returns (allowed, retry_after_seconds). Records the event when allowed and record=True."""
@@ -90,7 +115,7 @@ class RateLimiter:
                 q.append(now)
             return True, 0
 
-    def take(self, action: str, user_key: str):
+    def take(self, action: str, user_key: str, label: str = ""):
         """
         Checks every limit for `action` ("question" or "upload") and records the event only if all of
         them have room, so a refused request never uses up allowance. Returns (allowed, message).
@@ -105,11 +130,19 @@ class RateLimiter:
                     q.popleft()
                 if len(q) >= limit:
                     wait = int(window - (now - q[0])) + 1
-                    return False, message.format(limit=limit, wait=wait_text(wait))
+                    return False, message.format(limit=limit, wait=wait_text(wait), model=label or "This model")
                 buckets.append(q)
             for q in buckets:
                 q.append(now)
         return True, None
+
+    def undo(self, action: str, user_key: str):
+        """Returns the most recent event of `action` (e.g. an OCR read that failed) to every bucket it used."""
+        with self._lock:
+            for kind, scope, _ in QUOTAS[action]:
+                q = self._hits.get(f"{kind}:{user_key if scope == 'user' else 'app'}")
+                if q:
+                    q.pop()
 
     def remaining(self, kind: str, key: str) -> tuple[int, int]:
         """(left, limit) for one limit, e.g. questions left today for a user."""
@@ -127,7 +160,9 @@ class RateLimiter:
         with self._lock:
             recent = [t for t in self._hits.get(f"{kind}:{key}", deque()) if now - t <= window]
         return {"used": len(recent), "limit": limit,
-                "full_reset_in": int(window - (now - recent[-1])) + 1 if recent else 0}
+                "full_reset_in": int(window - (now - recent[-1])) + 1 if recent else 0,
+                # when the oldest event expires, i.e. when a full limit gets room again
+                "next_free_in": int(window - (now - recent[0])) + 1 if recent else 0}
 
     def events(self, kind: str, key: str) -> list[float]:
         """Timestamps of this key's events still inside the limit's window (for the usage chart)."""
@@ -165,14 +200,27 @@ _LIMITER_VERSION = _code_version(RateLimiter)
 
 
 def client_ip() -> str:
-    """Best-effort client IP (Streamlit >= 1.44); falls back to a per-session id."""
+    """
+    Best-effort per-visitor key for rate limits: the client IP when Streamlit knows it,
+    else the first X-Forwarded-For address set by the hosting proxy, else a random id kept
+    in this browser session. Never a value shared by everyone.
+    """
     try:
         ip = st.context.ip_address
         if ip:
             return str(ip)
     except Exception:
         pass
-    return "session:" + str(id(st.session_state))
+    try:
+        forwarded = st.context.headers.get("X-Forwarded-For", "")
+        first = forwarded.split(",")[0].strip()
+        if first:
+            return first
+    except Exception:
+        pass
+    if "_visitor_id" not in st.session_state:
+        st.session_state["_visitor_id"] = "session:" + uuid.uuid4().hex
+    return st.session_state["_visitor_id"]
 
 
 def wait_text(seconds: int) -> str:

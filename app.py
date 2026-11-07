@@ -4,6 +4,8 @@ import os
 import tempfile
 import time
 import uuid
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 import altair as alt
 import pandas as pd
@@ -39,10 +41,10 @@ from chain import get_conversational_chain  # noqa: E402
 from rag_pipeline import build_index, get_retriever, merge_indexes  # noqa: E402
 from utils import auth  # noqa: E402
 from utils.citations import sources_label  # noqa: E402
-from utils.llm import AVAILABLE_MODELS, default_model, is_rate_limit  # noqa: E402
+from utils.llm import AVAILABLE_MODELS, MODEL_DAILY_LIMITS, default_model, is_rate_limit, retry_after_seconds  # noqa: E402
 from utils.loaders import validate_pdf  # noqa: E402
 from utils.render import render_answer, split_followups, stream_preview  # noqa: E402
-from utils.security import MAX_QUESTION, clean_text, limiter, log  # noqa: E402
+from utils.security import MAX_QUESTION, clean_text, limiter, log, register_model_limits, wait_text  # noqa: E402
 
 with open(os.path.join(APP_DIR, "assets", "style.css"), encoding="utf-8") as f:
     st.markdown(f"<style>{f.read()}</style>", unsafe_allow_html=True)
@@ -150,11 +152,85 @@ MAX_CHATS = 20
 MAX_DOCS = 5             # PDFs per chat
 MAX_TOTAL_CHUNKS = 4000  # keeps a multi-PDF chat as fast as one large PDF
 
-for k, v in {"messages": [], "retriever": None, "doc_name": None, "docs": [], "to_answer": None, "chats": {}}.items():
+for k, v in {"messages": [], "retriever": None, "doc_name": None, "docs": [], "to_answer": None,
+             "answer_model": None, "chats": {}}.items():
     st.session_state.setdefault(k, v)
 st.session_state.setdefault("chat_history_store", InMemoryChatMessageHistory())
 st.session_state.setdefault("chat_id", uuid.uuid4().hex)
 USER_KEY = user["uid"] or user["email"]
+register_model_limits({m: MODEL_DAILY_LIMITS.get(m, (50, 500)) for m in AVAILABLE_MODELS})
+
+
+def model_name(model: str) -> str:
+    return AVAILABLE_MODELS.get(model, (model,))[0]
+
+
+def model_paused_for(model: str) -> int:
+    """Seconds until a model the provider rate-limited can be used again (0 = available)."""
+    return limiter().blocked_for(f"model:{model}")
+
+
+def model_headroom(model: str) -> float:
+    """Share of capacity left (0..1): the tighter of the app-wide budget and this user's allowance; -1 if paused."""
+    if model_paused_for(model):
+        return -1.0
+    shares = []
+    for kind, key in ((f"app_model_day:{model}", "app"), (f"model_day:{model}", USER_KEY)):
+        u = limiter().usage(kind, key)
+        shares.append((u["limit"] - u["used"]) / u["limit"])
+    return min(shares)
+
+
+def best_model() -> str:
+    """The model with the most capacity left; ties go to the preferred default (GROQ_MODEL)."""
+    preferred = default_model()
+    order = sorted(AVAILABLE_MODELS, key=lambda m: m != preferred)  # preferred first, then menu order
+    return max(order, key=model_headroom)  # max() keeps the first of equal scores
+
+
+def user_model_lock():
+    """
+    (model, seconds) if this user has used up their own allowance on any model; else None.
+    While locked the user can't use or switch to any model, so switching can't get around the limits.
+    """
+    for model in AVAILABLE_MODELS:
+        u = limiter().usage(f"model_day:{model}", USER_KEY)
+        if u["used"] >= u["limit"]:
+            return model, u["next_free_in"]
+    return None
+
+
+def lock_message(lock) -> str:
+    model, wait = lock
+    return (f"You've reached your daily limit on {model_name(model)}, so all models are paused for you "
+            f"until it resets in {wait_text(wait)}.")
+
+
+def reserve_question(model: str):
+    """
+    Takes one question from the user's overall allowance and from this model's own allowance.
+    Never switches model: if this one is out of quota, the question is refused. Returns (ok, message).
+    """
+    lock = user_model_lock()
+    if lock:
+        return False, lock_message(lock)
+    paused = model_paused_for(model)
+    if paused:
+        return False, f"{model_name(model)} has reached its usage limit. It resets in {wait_text(paused)}."
+    ok, message = limiter().take(f"model:{model}", USER_KEY, label=model_name(model))
+    if not ok:
+        return False, message
+    ok, message = limiter().take("question", USER_KEY)
+    if not ok:
+        limiter().undo(f"model:{model}", USER_KEY)  # nothing was asked, so give the model allowance back
+        return False, message
+    return True, None
+
+
+def release_question(model: str):
+    """Refunds a reserved question when no answer could be produced."""
+    limiter().undo(f"model:{model}", USER_KEY)
+    limiter().undo("question", USER_KEY)
 
 
 def get_session_history(session_id: str):
@@ -163,7 +239,8 @@ def get_session_history(session_id: str):
 
 def chat_title(messages) -> str:
     first = next((m for m in messages if m["role"] == "user"), {})
-    title = first.get("content") or first.get("attachment") or "New chat"
+    files = first.get("attachments") or ([first["attachment"]] if first.get("attachment") else [])
+    title = first.get("content") or ", ".join(files) or "New chat"
     return title if len(title) <= 40 else title[:39].rstrip() + "…"
 
 
@@ -197,6 +274,8 @@ def reset_current_chat():
 def new_chat():
     save_current_chat()
     reset_current_chat()
+    if not st.session_state.get("model_chosen"):
+        st.session_state.model_pick = best_model()  # spread usage across models
 
 
 def delete_chat(chat_id: str):
@@ -221,7 +300,8 @@ def open_chat(chat_id: str):
     st.session_state.chat_id = chat_id
 
 
-@st.cache_resource(show_spinner=False, max_entries=20, ttl=3600)
+# A 300-page PDF's index is roughly 25 MB (3,072-dim vectors), so caches stay small for ~1 GB hosts.
+@st.cache_resource(show_spinner=False, max_entries=8, ttl=1800)
 def process_pdf(_file_bytes: bytes, filename: str, file_hash: str, _allow_ocr=None):
     """Builds the index once per unique file. The temp copy is deleted immediately."""
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
@@ -233,7 +313,7 @@ def process_pdf(_file_bytes: bytes, filename: str, file_hash: str, _allow_ocr=No
         os.remove(tmp_path)
 
 
-@st.cache_resource(show_spinner=False, max_entries=20, ttl=3600)
+@st.cache_resource(show_spinner=False, max_entries=6, ttl=1800)
 def chat_index(file_hashes: tuple, _indexes: tuple):
     """One search index over every PDF in the chat. Cached, so switching chats doesn't rebuild it."""
     return merge_indexes(list(_indexes))
@@ -262,47 +342,42 @@ def say(text: str, **extra):
 STREAM_REFRESH = 0.05  # seconds between screen updates while streaming (~20 fps keeps the browser light)
 
 
-def stream_answer(question: str):
+def stream_answer(question: str, model: str):
     """
-    Streams the answer into the page as it arrives. If the chosen model is rate-limited before any
-    text arrives, retries once with another model. Returns (text, retrieved_docs, model_used).
+    Streams the answer from `model` only (never another one). If the provider says the model is over
+    its limit, the model is paused app-wide until the provider's reset time and the user is refunded.
+    Returns (text, retrieved_docs, seconds).
     """
     box = st.empty()
     box.markdown('<p class="thinking">Thinking…</p>', unsafe_allow_html=True)
-    chosen = st.session_state.model_pick
-    candidates = [chosen] + [m for m in MODEL_IDS if m != chosen][:1]
-    text, docs, used = "", [], chosen
+    text, docs, last_draw = "", [], 0.0
     started = time.perf_counter()
-    for model in candidates:
-        used, text, docs, last_draw = model, "", [], 0.0
-        chain = get_conversational_chain(st.session_state.retriever, get_session_history, model)
-        try:
-            for chunk in chain.stream({"question": question}, config={"configurable": {"session_id": "default"}}):
-                docs = chunk.get("docs", docs)
-                piece = chunk.get("answer")
-                if piece:
-                    text += piece
-                    now = time.perf_counter()
-                    if now - last_draw >= STREAM_REFRESH:
-                        box.markdown(stream_preview(text) + " ▍")
-                        last_draw = now
-            break
-        except Exception as e:
-            if is_rate_limit(e) and not text and model != candidates[-1]:
-                log.warning("model=%s rate-limited, falling back", model)
-                box.markdown('<p class="thinking">That model is busy, trying another…</p>', unsafe_allow_html=True)
-                continue
+    chain = get_conversational_chain(st.session_state.retriever, get_session_history, model)
+    try:
+        for chunk in chain.stream({"question": question}, config={"configurable": {"session_id": "default"}}):
+            docs = chunk.get("docs", docs)
+            piece = chunk.get("answer")
+            if piece:
+                text += piece
+                now = time.perf_counter()
+                if now - last_draw >= STREAM_REFRESH:
+                    box.markdown(stream_preview(text) + " ▍")
+                    last_draw = now
+    except Exception as e:
+        release_question(model)  # no answer, so this question doesn't count
+        if is_rate_limit(e):
+            wait = retry_after_seconds(e)
+            limiter().block(f"model:{model}", wait)
+            log.warning("model=%s rate-limited by provider for %ss", model, wait)
+            text = f"{model_name(model)} has reached its usage limit. It resets in {wait_text(wait)}."
+        else:
             log.exception("Answer generation failed")
-            text, docs = (
-                "The AI models have reached their usage limit for now. Please try again in a few minutes."
-                if is_rate_limit(e) else
-                "I couldn't get an answer just now. Try again, or pick another model from the top-left menu."
-            ), []
-            break
+            text = "I couldn't get an answer just now. Please try again."
+        docs = []
     box.empty()
     log.info("answer model=%s seconds=%.2f chars=%d chunks=%d",  # observability, server log only
-             used, time.perf_counter() - started, len(text), len(docs))
-    return text, docs, used, time.perf_counter() - started
+             model, time.perf_counter() - started, len(text), len(docs))
+    return text, docs, time.perf_counter() - started
 
 
 def render_sources(label):
@@ -316,7 +391,8 @@ def chat_as_markdown() -> str:
     lines = [f"# Chat about {st.session_state.doc_name or 'a PDF'}", ""]
     for m in st.session_state.messages:
         who = "You" if m["role"] == "user" else "Assistant"
-        body = m.get("content") or (f"[attached {m['attachment']}]" if m.get("attachment") else "")
+        files = m.get("attachments") or ([m["attachment"]] if m.get("attachment") else [])
+        body = m.get("content") or (f"[attached {', '.join(files)}]" if files else "")
         lines += [f"**{who}:**", "", body, ""]
     return "\n".join(lines)
 
@@ -327,60 +403,88 @@ def regenerate_last():
     question = next((m["content"] for m in reversed(msgs) if m["role"] == "user" and m.get("content")), None)
     if not question or msgs[-1].get("kind") != "answer":
         return
-    ok, message = limiter().take("question", USER_KEY)
+    ok, message = reserve_question(st.session_state.model_pick)
     if not ok:
         return say(message)  # keep the old answer if we can't make a new one
+    st.session_state.answer_model = st.session_state.model_pick
     msgs.pop()
     history = st.session_state.chat_history_store
     history.messages = history.messages[:-2]  # the last question/answer pair
     st.session_state.to_answer = question
 
 
+def add_pdf(pdf) -> bool:
+    """Validates, indexes and attaches one uploaded PDF. Reports problems in the chat; True if it was added."""
+    file_name = clean_text(pdf.name, 120)
+    ok, message = limiter().take("upload", USER_KEY)
+    if not ok:
+        say(message)
+        return False
+    data = pdf.getvalue()
+    file_hash = hashlib.sha256(data).hexdigest()
+    ocr_taken = []
+
+    def take_ocr():
+        ok, msg = limiter().take("ocr", USER_KEY)
+        if ok:
+            ocr_taken.append(True)
+        return ok, msg
+
+    try:
+        validate_pdf(data)
+        with st.spinner(f"Reading {file_name}… (scanned PDFs take up to a minute)"):
+            # A scanned PDF only spends OCR quota if it actually needs OCR (checked inside)
+            index = process_pdf(data, file_name, file_hash, take_ocr)
+    except Exception as e:
+        if ocr_taken:
+            limiter().undo("ocr", USER_KEY)  # the read failed, so it shouldn't count
+        if isinstance(e, ValueError):  # our own, user-safe messages
+            say(f"I couldn't use **{file_name}**. {e}")
+        else:
+            log.exception("PDF processing failed")  # details stay in the server log (item 17)
+            say(f"Something went wrong while reading **{file_name}**. Please try again.")
+        return False
+    problem = attach_pdf(file_name, file_hash, index)
+    if problem:
+        say(problem)
+        return False
+    if index.chunks and index.chunks[0].metadata.get("ocr"):
+        say(f"**{file_name}** is a scanned PDF, so I read it with text recognition. "
+            "Small recognition errors are possible, so double-check important numbers.", kind="notice")
+    return True
+
+
 def handle_submission(text: str, files):
-    """Validates the user turn, indexes an attached PDF and queues the question. Answers come after rerun."""
+    """Validates the user turn, indexes attached PDFs and queues the question. Answers come after rerun."""
     text = clean_text(text, MAX_QUESTION + 1)
-    pdf = files[0] if files else None
-    if not text and not pdf:
+    files = list(files or [])[:MAX_DOCS]
+    if not text and not files:
         return
-    file_name = clean_text(pdf.name, 120) if pdf else None
-    st.session_state.messages.append({"role": "user", "content": text, "attachment": file_name})
+    names = [clean_text(f.name, 120) for f in files]
+    st.session_state.messages.append({"role": "user", "content": text, "attachments": names})
 
     if len(text) > MAX_QUESTION:
         return say(f"That message is too long. Keep questions under {MAX_QUESTION:,} characters.")
 
-    if pdf:
-        ok, message = limiter().take("upload", USER_KEY)
-        if not ok:
-            return say(message)
-        data = pdf.getvalue()
-        file_hash = hashlib.sha256(data).hexdigest()
-        try:
-            validate_pdf(data)
-            with st.spinner(f"Reading {file_name}… (scanned PDFs take up to a minute)"):
-                # A scanned PDF only spends OCR quota if it actually needs OCR (checked inside)
-                index = process_pdf(data, file_name, file_hash, lambda: limiter().take("ocr", USER_KEY))
-        except ValueError as e:  # our own, user-safe messages
-            return say(f"I couldn't use **{file_name}**. {e}")
-        except Exception:
-            log.exception("PDF processing failed")  # details stay in the server log (item 17)
-            return say(f"Something went wrong while reading **{file_name}**. Please try again.")
-        problem = attach_pdf(file_name, file_hash, index)
-        if problem:
-            return say(problem)
-        if index.chunks and index.chunks[0].metadata.get("ocr"):
-            say(f"**{file_name}** is a scanned PDF, so I read it with text recognition. "
-                "Small recognition errors are possible, so double-check important numbers.", kind="notice")
+    if files:
+        added = [f for f in files if add_pdf(f)]
+        if not added and st.session_state.retriever is None:
+            return
         if not text:
-            n = len(st.session_state.docs)
-            return say(f"**{file_name}** is ready. What would you like to know about it?" if n == 1 else
-                       f"**{file_name}** added. You can now ask about all {n} PDFs in this chat.")
+            if added:
+                n = len(st.session_state.docs)
+                names_added = ", ".join(f"**{clean_text(f.name, 120)}**" for f in added)
+                say(f"{names_added} {'is' if len(added) == 1 else 'are'} ready. What would you like to know?"
+                    if n == len(added) else f"{names_added} added. You can now ask about all {n} PDFs in this chat.")
+            return
 
     if st.session_state.retriever is None:
         return say("Attach a PDF with the **+** button first, then ask your question.")
 
-    ok, message = limiter().take("question", USER_KEY)
+    ok, message = reserve_question(st.session_state.model_pick)
     if not ok:
         return say(message)
+    st.session_state.answer_model = st.session_state.model_pick
     st.session_state.to_answer = text
 
 
@@ -392,6 +496,14 @@ USAGE_CARDS = [  # (title, limit kind) on Settings → Usage → Overview
     ("Daily limit", "question_day"),
     ("Short-term limit (10 minutes)", "question"),
 ]
+
+
+def visitor_timezone():
+    """The browser's time zone (Streamlit >= 1.44), so charts show local hours even on a UTC server."""
+    try:
+        return ZoneInfo(st.context.timezone)
+    except Exception:
+        return timezone.utc
 
 
 def duration_text(seconds: int) -> str:
@@ -408,6 +520,17 @@ def usage_card(title: str, kind: str) -> str:
         f'<div class="set-card"><div class="set-card-title">{title}</div>'
         f'<div class="set-row"><span>{reset}</span><span>{left_pct}% remaining</span></div>'
         f'<div class="set-bar {level}"><i style="width:{left_pct}%"></i></div></div>'
+    )
+
+
+def model_card(model: str) -> str:
+    paused = model_paused_for(model)
+    if not paused:
+        return usage_card(model_name(model), f"model_day:{model}")
+    return (  # paused by the provider for everyone: show it as empty until the reset
+        f'<div class="set-card"><div class="set-card-title">{html.escape(model_name(model))}</div>'
+        f'<div class="set-row"><span>Usage limit reached. Resets in {duration_text(paused)}</span><span>0% remaining</span></div>'
+        f'<div class="set-bar full"><i style="width:0%"></i></div></div>'
     )
 
 
@@ -443,7 +566,8 @@ def render_analytics():
         hours_ago = [int((now - t) // 3600) for t in times]
         df = pd.DataFrame({"hours_ago": list(range(23, -1, -1))})
         df["Questions"] = [hours_ago.count(h) for h in df["hours_ago"]]
-        df["Hour"] = [time.strftime("%H:00", time.localtime(now - h * 3600)) for h in df["hours_ago"]]
+        tz = visitor_timezone()
+        df["Hour"] = [datetime.fromtimestamp(now - h * 3600, tz).strftime("%H:00") for h in df["hours_ago"]]
         chart = (
             alt.Chart(df).mark_bar(cornerRadiusTopLeft=3, cornerRadiusTopRight=3, color="#3B82F6")
             .encode(x=alt.X("Hour:N", sort=None, title=None, axis=alt.Axis(labelAngle=0, labelOverlap=True)),
@@ -487,6 +611,11 @@ def render_settings():
         "<p>Shared across all your chats and PDFs. These limits keep the app’s AI quota from running out "
         "for everyone; each one refills gradually after you use it.</p>"
         + "".join(usage_card(t, k) for t, k in USAGE_CARDS)
+        + "<h2 class=\"set-h2-gap\">Model limits</h2>"
+        "<p>Each model has its own daily allowance. If you use up any one of them, all models are paused "
+        "for you until it resets, so the limits can't be bypassed by switching models.</p>"
+        + (f'<div class="set-alert">{html.escape(lock_message(user_model_lock()))}</div>' if user_model_lock() else "")
+        + "".join(model_card(m) for m in MODEL_IDS)
         + "</div>",
         unsafe_allow_html=True,
     )
@@ -528,23 +657,41 @@ MODEL_IDS = list(AVAILABLE_MODELS)
 if default_model() not in MODEL_IDS:  # a custom GROQ_MODEL from .env is still offered
     AVAILABLE_MODELS[default_model()] = (default_model().split("/")[-1], "Set in your .env")
     MODEL_IDS.insert(0, default_model())
-st.session_state.setdefault("model_pick", default_model())
+    register_model_limits({default_model(): (50, 500)})
+# Start on whichever model has the most capacity left, unless the user picked one this session
+st.session_state.setdefault("model_chosen", False)
+st.session_state.setdefault("model_pick", best_model())
 
 
 def composer(key: str, placeholder: str):
     with st.container(key=key):
-        return st.chat_input(placeholder, key=f"{key}_input", accept_file=True, file_type=["pdf"])
+        return st.chat_input(placeholder, key=f"{key}_input", accept_file="multiple", file_type=["pdf"])
 
 
 def model_menu():
     """Model picker in the top-left of the chat area, like ChatGPT's."""
     with st.container(key="model_top"):
+        lock = user_model_lock()
         with st.popover(AVAILABLE_MODELS[st.session_state.model_pick][0]):
+            if lock:
+                st.markdown(f'<p class="model-lock">{html.escape(lock_message(lock))}</p>', unsafe_allow_html=True)
             st.radio(
-                "Model", MODEL_IDS, key="model_pick", label_visibility="collapsed",
+                "Model", MODEL_IDS, key="model_pick", label_visibility="collapsed", disabled=bool(lock),
+                on_change=lambda: st.session_state.update(model_chosen=True),
                 format_func=lambda m: AVAILABLE_MODELS[m][0],
-                captions=[AVAILABLE_MODELS[m][1] for m in MODEL_IDS],
+                captions=[model_caption(m) for m in MODEL_IDS],
             )
+
+
+def model_caption(model: str) -> str:
+    """Model description, or why it can't be used right now."""
+    paused = model_paused_for(model)
+    if paused:
+        return f"Limit reached, resets in {duration_text(paused)}"
+    u = limiter().usage(f"model_day:{model}", USER_KEY)
+    if u["used"] >= u["limit"]:
+        return f"Daily limit reached, resets in {duration_text(u['full_reset_in'])}"
+    return AVAILABLE_MODELS[model][1]
 
 
 # ---------------------------------------------------------------- sidebar
@@ -624,8 +771,9 @@ else:
         with st.chat_message(msg["role"]):
             if msg["role"] == "user":
                 # User text is escaped and shown as plain text, never rendered as markup (item 15)
-                if msg.get("attachment"):
-                    st.markdown(f'<div class="attach"><i>PDF</i>{html.escape(msg["attachment"])}</div>',
+                files = msg.get("attachments") or ([msg["attachment"]] if msg.get("attachment") else [])
+                if files:
+                    st.markdown("".join(f'<div class="attach"><i>PDF</i>{html.escape(f)}</div>' for f in files),
                                 unsafe_allow_html=True)
                 if msg.get("content"):
                     st.markdown(f'<div class="umsg">{html.escape(msg["content"])}</div>', unsafe_allow_html=True)
@@ -636,13 +784,11 @@ else:
     question = st.session_state.to_answer
     if question:
         st.session_state.to_answer = None
+        used = st.session_state.answer_model or st.session_state.model_pick
         with st.chat_message("assistant"):
-            text, docs, used, seconds = stream_answer(question)
+            text, docs, seconds = stream_answer(question, used)
             answer, followups = split_followups(text)
             sources = sources_label(docs)
-            if used != st.session_state.model_pick and docs:  # say so when the fallback answered
-                sources = f"Answered by {AVAILABLE_MODELS[used][0]} (the selected model was busy)" + (
-                    f". {sources}" if sources else "")
             history = st.session_state.chat_history_store.messages
             if history and history[-1].type == "ai":
                 history[-1].content = answer  # keep follow-up suggestions out of the model's memory (fewer tokens)

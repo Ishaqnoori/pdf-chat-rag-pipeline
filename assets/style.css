@@ -387,3 +387,7 @@ body:has([data-testid="stSidebarCollapsedControl"]) .st-key-model_top { left: 3.
 .set-tile span { color: var(--muted); font-size: 0.8rem; }
 .set-tile b { color: var(--text); font-size: 1.25rem; font-weight: 600; font-variant-numeric: tabular-nums; }
 .st-key-set_chart { max-width: 46rem; margin: 0 auto; border: 1px solid var(--line); border-radius: 14px; padding: 0.8rem 1rem 0.4rem; }
+.attach + .attach { margin-left: 0.35rem; }
+.set-page h2.set-h2-gap { margin-top: 2rem; }
+.model-lock { color: #E5484D; font-size: 0.8rem; margin: 0 0 0.5rem; max-width: 15rem; }
+.set-alert { border: 1px solid #E5484D; color: var(--text); border-radius: 12px; padding: 0.7rem 1rem; margin: 0 0 0.8rem; font-size: 0.88rem; }
