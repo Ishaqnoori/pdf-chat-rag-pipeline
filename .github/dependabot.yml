@@ -1,0 +1,8 @@
+# Weekly automatic pull requests for outdated or vulnerable packages (item 20)
+version: 2
+updates:
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5

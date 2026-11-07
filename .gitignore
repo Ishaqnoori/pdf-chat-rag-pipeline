@@ -1,8 +1,21 @@
-venv/
-__pycache__/
+# Secrets (item 1, 2)
 .env
-faiss_index/
+.env.*
+!.env.example
 .streamlit/secrets.toml
+
+# Local data
+*.db
+faiss_index/
 *.pdf
 !data/sample.pdf
+
+# Python / OS
+venv/
+__pycache__/
+*.pyc
 .DS_Store
+
+# Evaluation output (describes your documents)
+eval/results.json
+eval/testset.json

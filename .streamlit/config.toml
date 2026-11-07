@@ -1,0 +1,24 @@
+# No fixed base: Streamlit follows the browser/OS light or dark setting.
+[theme.light]
+primaryColor = "#0D0D0D"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F4F4F4"
+textColor = "#0D0D0D"
+
+[theme.dark]
+primaryColor = "#ECECEC"
+backgroundColor = "#212121"
+secondaryBackgroundColor = "#2F2F2F"
+textColor = "#ECECEC"
+
+[server]
+maxUploadSize = 20             # MB (item 16)
+enableXsrfProtection = true    # (item 9)
+enableCORS = true
+
+[client]
+toolbarMode = "minimal"
+showErrorDetails = "none"      # never show tracebacks to visitors (item 17)
+
+[browser]
+gatherUsageStats = false

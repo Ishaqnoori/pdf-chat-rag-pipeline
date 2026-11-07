@@ -1,44 +1,42 @@
-import os
-import shutil
-
 from langchain_community.vectorstores import FAISS
+from langchain_core.documents import Document
 
 from utils.embeddings import get_embeddings_model
 from utils.loaders import load_and_split_pdf
+from utils.retrieval import BM25, DocIndex, HybridRetriever, tokenize
 
-INDEX_DIR = "faiss_index"
 
-
-def build_vector_store(pdf_path: str, source_name: str | None = None):
+def build_index(pdf_path: str, source_name: str, allow_ocr=None) -> DocIndex:
     """
-    Builds a FAISS vector store from a PDF and saves it to disk.
+    Builds the in-memory search index for one PDF (vectors + keywords). Nothing is
+    written to disk, so a document's text never outlives the session that uploaded it.
     """
-    chunks = load_and_split_pdf(pdf_path, source_name=source_name)
+    chunks = load_and_split_pdf(pdf_path, source_name=source_name, allow_ocr=allow_ocr)
+    for i, chunk in enumerate(chunks):
+        chunk.metadata["chunk_id"] = i  # shared id so both searches can be fused
     vector_store = FAISS.from_documents(chunks, get_embeddings_model())
-
-    if os.path.exists(INDEX_DIR):
-        shutil.rmtree(INDEX_DIR)
-    vector_store.save_local(INDEX_DIR)
-
-    return vector_store
+    bm25 = BM25([tokenize(c.page_content) for c in chunks])
+    return DocIndex(chunks=chunks, vector_store=vector_store, bm25=bm25)
 
 
-def load_vector_store():
+def get_retriever(index: DocIndex, k: int = 4, mode: str = "hybrid") -> HybridRetriever:
+    return HybridRetriever(index=index, k=k, mode=mode)
+
+
+def merge_indexes(indexes: list[DocIndex]) -> DocIndex:
     """
-    Loads the FAISS store from disk, or returns None if there isn't one.
+    Combines several PDFs into one searchable index for a multi-document chat.
+    Reuses the vectors each PDF already has (no embedding calls); only the small
+    keyword index is rebuilt, which takes milliseconds.
     """
-    if not os.path.exists(INDEX_DIR):
-        return None
-    # Safe here only because we create the index ourselves — never load an index from an untrusted source.
-    return FAISS.load_local(INDEX_DIR, get_embeddings_model(), allow_dangerous_deserialization=True)
-
-
-def get_retriever(vector_store=None, k: int = 4):
-    """
-    Returns an MMR retriever. Pass an in-memory vector_store to skip reloading from disk.
-    """
-    if vector_store is None:
-        vector_store = load_vector_store()
-    if vector_store is None:
-        return None
-    return vector_store.as_retriever(search_type="mmr", search_kwargs={"k": k, "fetch_k": 20})
+    if len(indexes) == 1:
+        return indexes[0]
+    chunks, pairs = [], []
+    for idx in indexes:
+        vectors = idx.vector_store.index.reconstruct_n(0, idx.vector_store.index.ntotal)
+        for chunk, vector in zip(idx.chunks, vectors):
+            copy = Document(page_content=chunk.page_content, metadata={**chunk.metadata, "chunk_id": len(chunks)})
+            chunks.append(copy)
+            pairs.append((copy.page_content, vector.tolist()))
+    vector_store = FAISS.from_embeddings(pairs, get_embeddings_model(), metadatas=[c.metadata for c in chunks])
+    return DocIndex(chunks=chunks, vector_store=vector_store, bm25=BM25([tokenize(c.page_content) for c in chunks]))

@@ -1,36 +1,35 @@
 def _display_page(doc):
-    """
-    PyPDFLoader stores 'page' as 0-indexed, so page 1 shows up as 0.
-    Prefer 'page_label' (the printed page number) when available, else page + 1.
-    """
+    """PyPDFLoader pages are 0-indexed; prefer the printed page label, else page + 1."""
     label = doc.metadata.get("page_label")
     if label not in (None, ""):
         return str(label)
     page = doc.metadata.get("page")
-    if isinstance(page, int):
-        return str(page + 1)
-    return None
+    return str(page + 1) if isinstance(page, int) else "Unknown"
 
 
 def format_docs_with_citations(docs):
-    """
-    Formats retrieved documents into one context string with source/page tags.
-    """
-    formatted = []
-    for i, doc in enumerate(docs):
-        source = doc.metadata.get("source", "Unknown")
-        page = _display_page(doc) or "Unknown"
-        formatted.append(f"--- Document {i + 1} (Source: {source}, Page: {page}) ---\n{doc.page_content}")
-    return "\n\n".join(formatted)
+    """Joins retrieved chunks into one context string tagged with source and page."""
+    return "\n\n".join(
+        f"--- Document {i + 1} (Source: {d.metadata.get('source', 'Unknown')}, Page: {_display_page(d)}) ---\n"
+        f"{d.page_content}"
+        for i, d in enumerate(docs)
+    )
 
 
-def extract_citations(docs):
-    """
-    Returns unique, human-readable page numbers in ascending order.
-    """
-    pages = {p for p in (_display_page(d) for d in docs) if p is not None}
+def page_numbers(docs) -> list[str]:
+    """Unique page labels of the retrieved chunks, in reading order."""
+    pages = {_display_page(d) for d in docs} - {"Unknown"}
+    return sorted(pages, key=lambda p: (0, int(p), "") if p.isdigit() else (1, 0, p))
 
-    def sort_key(p):
-        return (0, int(p), "") if p.isdigit() else (1, 0, p)
 
-    return sorted(pages, key=sort_key)
+def sources_label(docs) -> str:
+    """'Pages 1, 2' for one PDF; 'invoice.pdf p. 1, 2; resume.pdf p. 3' when several PDFs are in the chat."""
+    by_source: dict[str, list] = {}
+    for d in docs:
+        by_source.setdefault(d.metadata.get("source", "PDF"), []).append(d)
+    if not by_source:
+        return ""
+    if len(by_source) == 1:
+        pages = page_numbers(docs)
+        return f"{'Page' if len(pages) == 1 else 'Pages'} {', '.join(pages)}" if pages else ""
+    return "; ".join(f"{src} p. {', '.join(page_numbers(ds))}" for src, ds in by_source.items() if page_numbers(ds))

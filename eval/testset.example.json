@@ -1,0 +1,16 @@
+[
+  {
+    "question": "What is the invoice number?",
+    "pages": [1],
+    "answer_contains": "MKT-"
+  },
+  {
+    "question": "How much GST was charged on the mouse?",
+    "pages": [1, 2]
+  },
+  {
+    "question": "Who is the seller and where are they located?",
+    "pages": [1],
+    "answer_contains": "Hyderabad"
+  }
+]
