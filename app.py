@@ -1,4 +1,5 @@
 import hashlib
+import json
 import html
 import os
 import tempfile
@@ -20,7 +21,8 @@ st.set_page_config(page_title="Ask your PDF", page_icon="📄", layout="wide")
 # .env loads first so placeholder values in secrets.toml can't override real keys.
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(APP_DIR, ".env"))  # always the .env next to app.py
-CONFIG_KEYS = ["GOOGLE_API_KEY", "GROQ_API_KEY", "FIREBASE_API_KEY", "GROQ_MODEL", "GEMINI_EMBEDDING_MODEL"]
+CONFIG_KEYS = ["GOOGLE_API_KEY", "GROQ_API_KEY", "FIREBASE_API_KEY", "GROQ_MODEL", "GEMINI_EMBEDDING_MODEL",
+               "ADMIN_EMAILS"]
 
 
 def _is_placeholder(value) -> bool:
@@ -44,6 +46,7 @@ from utils.citations import sources_label  # noqa: E402
 from utils.llm import AVAILABLE_MODELS, MODEL_DAILY_LIMITS, default_model, is_rate_limit, retry_after_seconds  # noqa: E402
 from utils.loaders import validate_pdf  # noqa: E402
 from utils.render import render_answer, split_followups, stream_preview  # noqa: E402
+from utils.stats import is_admin, stats  # noqa: E402
 from utils.security import MAX_QUESTION, clean_text, limiter, log, register_model_limits, wait_text  # noqa: E402
 
 with open(os.path.join(APP_DIR, "assets", "style.css"), encoding="utf-8") as f:
@@ -375,9 +378,30 @@ def stream_answer(question: str, model: str):
             text = "I couldn't get an answer just now. Please try again."
         docs = []
     box.empty()
+    seconds = time.perf_counter() - started
+    stats().record_answer(model, seconds, ok=bool(docs))  # for the owner's Admin page
     log.info("answer model=%s seconds=%.2f chars=%d chunks=%d",  # observability, server log only
-             model, time.perf_counter() - started, len(text), len(docs))
-    return text, docs, time.perf_counter() - started
+             model, seconds, len(text), len(docs))
+    return text, docs, seconds
+
+
+def save_feedback(index: int, key: str):
+    """Stores 👍/👎 for the answer at messages[index] (once; changing the vote updates it)."""
+    rating = st.session_state.get(key)
+    msgs = st.session_state.messages
+    if rating is None or index >= len(msgs):
+        return
+    msg = msgs[index]
+    msg["rating"] = rating
+    question = next((m.get("content") for m in reversed(msgs[:index]) if m["role"] == "user" and m.get("content")), "")
+    stats().record_feedback({"rating": rating, "question": question[:500], "answer": msg["content"][:2000],
+                             "model": msg.get("model"), "sources": msg.get("sources", "")})
+
+
+def feedback_widget(index: int):
+    key = f"fb_{st.session_state.chat_id}_{index}"
+    with st.container(key=f"fbwrap_{index}"):
+        st.feedback("thumbs", key=key, on_change=save_feedback, args=(index, key))
 
 
 def render_sources(label):
@@ -511,8 +535,8 @@ def duration_text(seconds: int) -> str:
     return f"{h}h {m}m" if h else f"{m}m" if m else f"{max(1, seconds)}s"
 
 
-def usage_card(title: str, kind: str) -> str:
-    u = limiter().usage(kind, USER_KEY)
+def usage_card(title: str, kind: str, key: str | None = None) -> str:
+    u = limiter().usage(kind, key or USER_KEY)
     left_pct = max(0, round(100 * (u["limit"] - u["used"]) / u["limit"]))
     reset = f"Resets in {duration_text(u['full_reset_in'])}" if u["used"] else "Full allowance available"
     level = "full" if left_pct == 0 else "low" if left_pct <= 20 else ""
@@ -584,8 +608,71 @@ def render_analytics():
                     unsafe_allow_html=True)
 
 
+def render_admin():
+    """Owner-only overview of the whole app. Access is checked again here, on the server."""
+    if not is_admin(user["email"]):
+        st.session_state.settings_tab = "usage"
+        return render_settings()
+    snap = stats().snapshot()
+    answers = snap["answers"]
+    total = sum(a["count"] for a in answers.values())
+    errors = sum(a["errors"] for a in answers.values())
+    secs = sum(a["seconds"] for a in answers.values())
+    ratings = [f["rating"] for f in snap["feedback"]]
+    tiles = [
+        ("Running for", duration_text(int(snap["uptime"]))),
+        ("Answers", str(total)),
+        ("Average answer time", f"{secs / total:.1f}s" if total else "–"),
+        ("Errors", str(errors)),
+        ("Helpful answers", f"{round(100 * sum(ratings) / len(ratings))}%" if ratings else "–"),
+    ]
+    app_cards = [("Questions today, all users", "app_question_day"), ("Uploads today, all users", "app_upload_day"),
+                 ("Scanned PDFs today, all users", "app_ocr_day")]
+    model_rows = ""
+    for m in MODEL_IDS:
+        a = answers.get(m, {})
+        n = a.get("count", 0)
+        avg = f"{a['seconds'] / n:.1f}s" if n else "–"
+        model_rows += (f"<tr><td>{html.escape(model_name(m))}</td><td>{n}</td><td>{avg}</td>"
+                       f"<td>{a.get('errors', 0)}</td></tr>")
+    st.markdown(
+        '<div class="set-page"><h1>Admin</h1><p>Only visible to emails in <code>ADMIN_EMAILS</code>. '
+        "Counters cover all users since the app last started.</p>"
+        '<div class="set-tiles">'
+        + "".join(f'<div class="set-tile"><span>{k}</span><b>{html.escape(v)}</b></div>' for k, v in tiles)
+        + '</div><h2>App-wide limits</h2>'
+        + "".join(usage_card(t, k, key="app") for t, k in app_cards)
+        + "".join(model_card_app(m) for m in MODEL_IDS)
+        + '<h2 class="set-h2-gap">Models</h2><table class="set-table"><tr><th>Model</th><th>Answers</th>'
+        "<th>Avg time</th><th>Errors</th></tr>" + model_rows + "</table>"
+        + '<h2 class="set-h2-gap">Recent feedback</h2>'
+        + ("".join(
+            f'<div class="set-fb"><span>{"👍" if f["rating"] else "👎"}</span><div><b>{html.escape(f["question"] or "(no question)")}</b>'
+            f'<small>{html.escape(model_name(f.get("model") or ""))}, {html.escape(f["time"])}</small></div></div>'
+            for f in snap["feedback"][:20]) or "<p>No feedback yet.</p>")
+        + "</div>",
+        unsafe_allow_html=True,
+    )
+    if snap["feedback"]:
+        with st.container(key="set_logout"):
+            st.download_button("Download feedback (JSONL)", "\n".join(json.dumps(f, ensure_ascii=False) for f in snap["feedback"]),
+                               file_name="feedback.jsonl", mime="application/json", icon=":material/download:")
+
+
+def model_card_app(model: str) -> str:
+    paused = model_paused_for(model)
+    title = f"{model_name(model)}, all users"
+    if not paused:
+        return usage_card(title, f"app_model_day:{model}", key="app")
+    return (f'<div class="set-card"><div class="set-card-title">{html.escape(title)}</div>'
+            f'<div class="set-row"><span>Paused by the provider. Resets in {duration_text(paused)}</span>'
+            f'<span>0% remaining</span></div><div class="set-bar full"><i style="width:0%"></i></div></div>')
+
+
 def render_settings():
     tab = st.session_state.settings_tab
+    if tab == "admin":
+        return render_admin()
     if tab == "account":
         method = {"google": "Google", "firebase": "Email and password"}.get(user.get("method"), "Email and password")
         rows = [("Name", user["name"]), ("Email", user["email"]), ("Signed in with", method)]
@@ -627,7 +714,10 @@ def settings_sidebar():
             st.session_state.view = "chat"
             st.rerun()
         st.markdown('<p class="side-label">Settings</p>', unsafe_allow_html=True)
-        for tab, label, icon in (("usage", "Usage", ":material/speed:"), ("account", "Account", ":material/person:")):
+        tabs = [("usage", "Usage", ":material/speed:"), ("account", "Account", ":material/person:")]
+        if is_admin(user["email"]):
+            tabs.append(("admin", "Admin", ":material/admin_panel_settings:"))
+        for tab, label, icon in tabs:
             if st.button(label, icon=icon, key=f"set_{tab}", use_container_width=True):
                 st.session_state.settings_tab = tab
                 st.rerun()
@@ -767,7 +857,7 @@ else:
         st.markdown(f'<div class="doc-title">Chatting about <b>{html.escape(st.session_state.doc_name)}</b></div>',
                     unsafe_allow_html=True)
 
-    for msg in st.session_state.messages:
+    for i, msg in enumerate(st.session_state.messages):
         with st.chat_message(msg["role"]):
             if msg["role"] == "user":
                 # User text is escaped and shown as plain text, never rendered as markup (item 15)
@@ -780,6 +870,8 @@ else:
             else:
                 render_answer(msg["content"])
                 render_sources(msg.get("sources", msg.get("pages")))
+                if msg.get("kind") == "answer":
+                    feedback_widget(i)
 
     question = st.session_state.to_answer
     if question:
@@ -794,6 +886,8 @@ else:
                 history[-1].content = answer  # keep follow-up suggestions out of the model's memory (fewer tokens)
             render_answer(answer)
             render_sources(sources)
+            if docs:
+                feedback_widget(len(st.session_state.messages))  # index the answer is about to get
         say(answer, sources=sources, followups=followups, kind="answer" if docs else "notice",
             model=used, seconds=round(seconds, 1))
 

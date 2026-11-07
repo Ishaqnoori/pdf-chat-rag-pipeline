@@ -1,0 +1,17 @@
+# Never bake secrets or local data into the image; pass keys at run time (--env-file .env)
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+data/feedback.jsonl
+eval/results.json
+eval/testset.json
+*.db
+venv/
+__pycache__/
+*.pyc
+.git/
+.github/
+tests/
+*.bat
+*.ps1

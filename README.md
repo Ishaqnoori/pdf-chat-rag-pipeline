@@ -1,5 +1,7 @@
 # Ask your PDF
 
+![tests](https://github.com/Ishaqnoori/pdf-chat-rag-pipeline/actions/workflows/tests.yml/badge.svg)
+
 Chat with any PDF. Upload a document, ask questions in plain language, and get answers drawn
 only from that document, as text, tables or charts.
 
@@ -20,6 +22,7 @@ PDF → validate → chunk → Gemini embeddings + BM25 keyword index (in memory
 - Scanned PDFs work too: pages without a text layer are read with Gemini's document vision (OCR)
 - Regenerate an answer, export a chat as Markdown; switch, rename or delete chats in **Recents**
 - Built-in evaluation script for retrieval and answer quality: see [eval/README.md](eval/README.md)
+- 👍/👎 feedback on answers, an owner-only **Admin** page (`ADMIN_EMAILS`), automated tests on every push
 - Accounts with Firebase (sign up, email verification, password reset) or **Continue with Google**
 - Security hardening: see [SECURITY.md](SECURITY.md)
 
@@ -40,6 +43,23 @@ Manual start: `venv\Scripts\python -m streamlit run app.py`
 1. Push to GitHub with `update_github.ps1` (it blocks commits that contain secrets).
 2. On share.streamlit.io, create an app from this repo with `app.py` as the entry point.
 3. In **Advanced settings → Secrets**, paste the three keys (see `.streamlit/secrets.toml.example`).
+
+## Docker
+
+```bash
+docker build -t ask-your-pdf .
+docker run -p 8501:8501 --env-file .env ask-your-pdf
+```
+Secrets are passed at run time and are never copied into the image (see `.dockerignore`).
+For Google sign-in, mount your secrets file: `-v "%cd%\.streamlit\secrets.toml:/app/.streamlit/secrets.toml:ro"`.
+
+## Tests
+
+```bash
+venv\Scripts\python -m pip install pytest
+venv\Scripts\python -m pytest -q
+```
+GitHub Actions runs them, plus a dependency vulnerability scan, on every push.
 
 ## Usage limits
 
@@ -78,6 +98,8 @@ utils/llm.py            Groq models
 utils/embeddings.py     Gemini embeddings
 assets/style.css        Interface styles
 eval/run_eval.py        Retrieval / answer evaluation
+utils/stats.py          App-wide stats and answer feedback (Admin page)
+tests/                  Automated tests (run in GitHub Actions)
 ```
 
 ## Limitations

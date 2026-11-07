@@ -19,3 +19,6 @@ __pycache__/
 # Evaluation output (describes your documents)
 eval/results.json
 eval/testset.json
+
+# Answer feedback (contains questions/answers about users' documents)
+data/feedback.jsonl
