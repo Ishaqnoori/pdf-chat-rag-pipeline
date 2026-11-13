@@ -8,7 +8,7 @@ langchain-community>=0.4.2,<0.5
 langchain-text-splitters>=1.0.0,<2
 langchain-google-genai>=4.0.0,<5
 langchain-groq>=1.0.0,<2
-faiss-cpu>=1.8.0,<2
+faiss-cpu>=1.15.1,<2
 pypdf>=6.21.4,<7
 
 # App
