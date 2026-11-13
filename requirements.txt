@@ -9,7 +9,7 @@ langchain-text-splitters>=1.0.0,<2
 langchain-google-genai>=4.0.0,<5
 langchain-groq>=1.0.0,<2
 faiss-cpu>=1.8.0,<2
-pypdf>=6.21.4,<7
+pypdf>=7.0.0,<8
 
 # App
 streamlit>=1.66.1,<2
