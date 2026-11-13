@@ -2,7 +2,7 @@
 # Dependabot (.github/dependabot.yml) proposes upgrades weekly; test them, then merge.
 
 # Core RAG
-langchain>=1.0.0,<2
+langchain>=1.4.9,<2
 langchain-core>=1.0.0,<2
 langchain-community>=0.4.2,<0.5
 langchain-text-splitters>=1.0.0,<2
